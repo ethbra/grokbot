@@ -29,6 +29,7 @@ jobs:
       - name: imports and commands register
         env:
           DISCORD_TOKEN: dummy
+          OPENAI_API_KEY: dummy
           XAI_API_KEY: dummy
           DATA_DIR: /tmp/grokbot-ci
         run: python -c "import bot; assert {c.name for c in bot.bot.tree.get_commands()} == {'ask', 'grokusage'}"

@@ -1,18 +1,26 @@
-"""Grok Discord bot with live search.
+"""Discord bot: a cheap main model (default OpenAI gpt-6-luna) with live search,
+and Grok on call for X/Twitter.
 
-Talks to xAI's Responses API (POST /v1/responses).
+Both providers speak the same Responses API (POST /v1/responses), so one loop
+drives either. The main model gets two functions and decides itself when to use
+them; no separate router call:
 
-Search modes:
-  web   Grok calls our own `search_web` function, which the bot answers with
-        Tavily (free tier, short snippets keep Grok's prompt small). Default.
-  deep  xAI's server-side web_search + x_search (thorough, ~3-6x the cost).
-  x     xAI's server-side x_search only (billed per post fetched).
-  none  no search, cheapest.
+  search_web  answered by the bot with Tavily (free tier, 5 short excerpts)
+  search_x    answered by Grok with xAI's x_search; only offered when an xAI key
+              is set, capped per answer because X search is billed per post
+
+Search modes (/ask search:..., DEFAULT_SEARCH for mentions):
+  auto  main model, both functions available (default)
+  web   main model, search_web only
+  x     main model, made to call search_x first
+  deep  the whole question goes to Grok with xAI's web_search + x_search
+  none  main model, no tools
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -31,22 +39,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-XAI_API_KEY = os.environ["XAI_API_KEY"]
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
-MODEL = os.getenv("GROK_MODEL", "grok-4.3")
+MODEL = os.getenv("MODEL", "gpt-6-luna")
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.3")
+# Optional, OpenAI reasoning models only: low | medium | high. Unset = model default.
+REASONING_EFFORT = os.getenv("REASONING_EFFORT", "")
+# Optional price override for MODEL, USD per 1M tokens: "input,cached_input,output".
+MODEL_PRICE = os.getenv("MODEL_PRICE", "")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    "You are Grok, chatting in a Discord server. Be concise and use Discord markdown. "
-    "When a question needs current or factual information you are unsure of, search first, "
-    "and cite the sources you used.",
+    "You are a helpful assistant chatting in a Discord server. Be concise and use Discord markdown. "
+    "When a question needs current or factual information you are unsure of, use search_web first. "
+    "Use search_x only when X/Twitter itself matters: what people are posting or saying right now, "
+    "reactions to breaking news, or posts by specific accounts. It costs more, so don't use it for "
+    "ordinary facts. Cite the sources you used.",
 )
-DEFAULT_SEARCH = os.getenv("DEFAULT_SEARCH", "web")
+DEFAULT_SEARCH = os.getenv("DEFAULT_SEARCH", "auto")
 # Spending guards (USD). 0 disables a limit.
 DAILY_BUDGET_USD = float(os.getenv("DAILY_BUDGET_USD", "2.00"))
 PER_USER_DAILY_USD = float(os.getenv("PER_USER_DAILY_USD", "0.50"))
 USER_COOLDOWN_S = float(os.getenv("USER_COOLDOWN_S", "5"))
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1500"))
+# Reasoning tokens count toward this on reasoning models, so leave headroom.
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "4000"))
 SEARCH_RESULTS = int(os.getenv("SEARCH_RESULTS", "5"))
+X_SEARCHES_PER_ANSWER = int(os.getenv("X_SEARCHES_PER_ANSWER", "1"))
 MAX_TOOL_ROUNDS = 3
 SHOW_COST = os.getenv("SHOW_COST", "true").lower() == "true"
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -54,31 +72,90 @@ HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", "/tmp/grokbot-heartbeat"))
 # Optional: comma-separated guild IDs for instant slash-command sync while testing.
 DEV_GUILD_IDS = [int(g) for g in os.getenv("DEV_GUILD_IDS", "").split(",") if g.strip()]
 
-XAI_URL = "https://api.x.ai/v1/responses"
 TAVILY_URL = "https://api.tavily.com/search"
 DISCORD_LIMIT = 2000
-THREAD_TTL_S = 30 * 86400  # xAI keeps stored responses for 30 days
+THREAD_TTL_S = 30 * 86400  # both providers keep stored responses for 30 days
+
+# USD per 1M tokens: input, cached input, output. xAI also reports exact cost per
+# response (cost_in_nano_usd), which wins when present.
+PRICES = {
+    "gpt-6-luna": (0.10, 0.01, 0.50),
+    "gpt-6-sol": (2.00, 0.20, 10.00),
+    "grok-4.3": (1.25, 0.20, 2.50),
+    "grok-4.7": (2.00, 0.50, 6.00),
+}
+if MODEL_PRICE:
+    PRICES[MODEL] = tuple(float(x) for x in MODEL_PRICE.split(","))
 
 log = logging.getLogger("grokbot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-SEARCH_FUNCTION = {
-    "type": "function",
-    "name": "search_web",
-    "description": "Search the web for current information. Returns titles, URLs and short excerpts.",
-    "parameters": {
-        "type": "object",
-        "properties": {"query": {"type": "string", "description": "The search query"}},
-        "required": ["query"],
-    },
+
+def fn(name: str, description: str) -> dict:
+    return {
+        "type": "function",
+        "name": name,
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "What to search for"}},
+            "required": ["query"],
+        },
+    }
+
+
+SEARCH_WEB = fn("search_web", "Search the web for current information. Returns titles, URLs and short excerpts.")
+SEARCH_X = fn(
+    "search_x",
+    "Search posts on X (Twitter): what people are saying now, reactions to news, posts by specific "
+    "accounts. Returns a summary with post links. Expensive: only when X itself is relevant.",
+)
+
+
+# --------------------------------------------------------------------------- providers
+
+
+@dataclass(frozen=True)
+class Provider:
+    name: str
+    url: str
+    key: str
+
+
+PROVIDERS = {
+    "openai": Provider("openai", "https://api.openai.com/v1/responses", OPENAI_API_KEY),
+    "xai": Provider("xai", "https://api.x.ai/v1/responses", XAI_API_KEY),
 }
+
+
+def provider_for(model: str) -> Provider:
+    return PROVIDERS["xai" if model.startswith("grok") else "openai"]
+
+
+MAIN = provider_for(MODEL)
+if not MAIN.key:
+    raise SystemExit(f"{MODEL} needs {'XAI_API_KEY' if MAIN.name == 'xai' else 'OPENAI_API_KEY'}")
+HAS_GROK = bool(XAI_API_KEY)
+
+
+def token_cost(model: str, usage: dict) -> float:
+    if usage.get("cost_in_nano_usd") is not None:
+        return usage["cost_in_nano_usd"] / 1e9
+    price = PRICES.get(model)
+    if not price:
+        log.warning("no price for %s; set MODEL_PRICE so spend caps work", model)
+        return 0.0
+    total_in = usage.get("input_tokens") or 0
+    cached = (usage.get("input_tokens_details") or {}).get("cached_tokens") or 0
+    out = usage.get("output_tokens") or 0  # includes reasoning tokens
+    return ((total_in - cached) * price[0] + cached * price[1] + out * price[2]) / 1e6
 
 
 # --------------------------------------------------------------------------- state
 
 
 class Store:
-    """Spend per user per day, and which Discord message belongs to which Grok thread.
+    """Spend per user per day, and which Discord message belongs to which model thread.
 
     SQLite in DATA_DIR so both survive restarts.
     """
@@ -128,13 +205,13 @@ class Store:
         )
         self.db.commit()
 
-    def remember(self, message_ids: list[int], response_id: str | None) -> None:
-        if not response_id:
+    def remember(self, message_ids: list[int], thread: str | None) -> None:
+        """thread is "<provider>:<model>:<response id>"."""
+        if not thread:
             return
         now = time.time()
         self.db.executemany(
-            "INSERT OR REPLACE INTO threads VALUES (?, ?, ?)",
-            [(m, response_id, now) for m in message_ids],
+            "INSERT OR REPLACE INTO threads VALUES (?, ?, ?)", [(m, thread, now) for m in message_ids]
         )
         self.db.commit()
 
@@ -146,32 +223,30 @@ class Store:
         return row[0] if row else None
 
 
-# --------------------------------------------------------------------------- grok
+# --------------------------------------------------------------------------- model calls
 
 
 @dataclass
-class GrokReply:
+class Reply:
     text: str = ""
-    response_id: str | None = None
+    thread: str | None = None
     citations: list[str] = field(default_factory=list)
     cost_usd: float = 0.0
     searches: dict[str, int] = field(default_factory=dict)
+    models: list[str] = field(default_factory=list)
+    searched_urls: list[str] = field(default_factory=list)
 
     def count(self, kind: str, n: int = 1) -> None:
         if n:
             self.searches[kind] = self.searches.get(kind, 0) + n
 
-
-def server_tools(mode: str) -> list[dict]:
-    if mode == "deep":
-        return [{"type": "web_search"}, {"type": "x_search"}]
-    if mode == "x":
-        return [{"type": "x_search"}]
-    return []
+    def used(self, model: str) -> None:
+        if model not in self.models:
+            self.models.append(model)
 
 
-def absorb(reply: GrokReply, data: dict) -> list[dict]:
-    """Fold one /v1/responses result into reply; return any function calls to run."""
+def absorb(reply: Reply, model: str, data: dict) -> tuple[str, list[dict]]:
+    """Fold one /v1/responses result into reply. Returns (text, function calls)."""
     calls, texts = [], []
     for item in data.get("output", []):
         kind = item.get("type")
@@ -188,102 +263,146 @@ def absorb(reply: GrokReply, data: dict) -> list[dict]:
         url = c if isinstance(c, str) else c.get("url")
         if url:
             reply.citations.append(url)
-    if texts:
-        reply.text = "".join(texts).strip()
-    reply.response_id = data.get("id") or reply.response_id
 
     usage = data.get("usage") or {}
-    if usage.get("cost_in_nano_usd") is not None:
-        reply.cost_usd += usage["cost_in_nano_usd"] / 1e9
+    reply.cost_usd += token_cost(model, usage)
+    reply.used(model)
     tools = usage.get("server_side_tool_usage_details") or {}
     reply.count("xAI web", tools.get("web_search_calls") or 0)
     reply.count("X", tools.get("x_search_calls") or 0)
-    return calls
+    return "".join(texts).strip(), calls
 
 
-class Grok:
+class Assistant:
     def __init__(self) -> None:
-        self.xai = httpx.AsyncClient(
-            headers={"Authorization": f"Bearer {XAI_API_KEY}"},
-            timeout=httpx.Timeout(180.0),  # server-side searches can take a while
-        )
-        self.tavily = httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+        self.http = httpx.AsyncClient(timeout=httpx.Timeout(180.0))  # server-side search is slow
 
     async def aclose(self) -> None:
-        await self.xai.aclose()
-        await self.tavily.aclose()
+        await self.http.aclose()
 
-    async def _post(self, body: dict) -> dict:
-        r = await self.xai.post(XAI_URL, json=body)
+    async def post(self, provider: Provider, body: dict) -> dict:
+        r = await self.http.post(provider.url, json=body, headers={"Authorization": f"Bearer {provider.key}"})
         if r.status_code >= 400:
-            log.error("xAI error %s: %s", r.status_code, r.text[:500])
-            raise RuntimeError(f"xAI API error {r.status_code}")
+            log.error("%s error %s: %s", provider.name, r.status_code, r.text[:500])
+            raise RuntimeError(f"{provider.name} API error {r.status_code}")
         return r.json()
 
-    async def search(self, query: str) -> tuple[str, list[str]]:
-        r = await self.tavily.post(
+    async def search_web(self, reply: Reply, query: str) -> str:
+        r = await self.http.post(
             TAVILY_URL,
             headers={"Authorization": f"Bearer {TAVILY_API_KEY}"},
             json={"query": query, "max_results": SEARCH_RESULTS, "search_depth": "basic"},
+            timeout=30.0,
         )
         r.raise_for_status()
-        results = r.json().get("results", [])
-        trimmed = [
+        results = [
             {"title": x.get("title"), "url": x.get("url"), "excerpt": (x.get("content") or "")[:700]}
-            for x in results
+            for x in r.json().get("results", [])
         ]
-        return json.dumps(trimmed, ensure_ascii=False), [x["url"] for x in trimmed if x.get("url")]
+        reply.count("web")
+        reply.searched_urls += [x["url"] for x in results if x.get("url")]
+        return json.dumps(results, ensure_ascii=False)
 
-    async def ask(self, prompt: str, mode: str, previous_id: str | None, user_id: int) -> GrokReply:
-        if mode == "web" and not TAVILY_API_KEY:
-            mode = "deep"  # no Tavily key: fall back to xAI's own search
-        tools = [SEARCH_FUNCTION] if mode == "web" else server_tools(mode)
+    async def search_x(self, reply: Reply, query: str) -> str:
+        """Hand the X part to Grok and return its summary to the main model."""
+        data = await self.post(
+            PROVIDERS["xai"],
+            {
+                "model": GROK_MODEL,
+                "input": [{
+                    "role": "user",
+                    "content": f"Search X for: {query}\n\nReport what the relevant posts say: handle, date, "
+                    "the gist, and the post URL. Be concise and factual. Say so if nothing relevant turned up.",
+                }],
+                "tools": [{"type": "x_search"}],
+                "max_output_tokens": 1200,
+                "store": False,
+            },
+        )
+        before = reply.searches.get("X", 0)
+        text, _ = absorb(reply, GROK_MODEL, data)
+        if reply.searches.get("X", 0) == before:
+            reply.count("X")
+        return text or "No results."
 
-        body: dict = {
-            "model": MODEL,
-            "input": [{"role": "user", "content": prompt}],
-            "max_output_tokens": MAX_OUTPUT_TOKENS,
-            "store": True,  # follow-up replies continue the thread via previous_response_id
-            "user": str(user_id),
-        }
-        if previous_id:
-            body["previous_response_id"] = previous_id  # carries the system prompt too
+    async def run_function(self, reply: Reply, call: dict, x_used: list[int]) -> str:
+        name = call.get("name")
+        try:
+            query = json.loads(call.get("arguments") or "{}").get("query", "")
+            if name == "search_web":
+                return await self.search_web(reply, query)
+            if name == "search_x":
+                if x_used[0] >= X_SEARCHES_PER_ANSWER:
+                    return json.dumps({"error": "X search limit for this answer reached; answer with what you have"})
+                x_used[0] += 1
+                return await self.search_x(reply, query)
+            return json.dumps({"error": f"unknown function {name}"})
+        except Exception as e:  # tell the model, let it answer anyway
+            log.warning("%s failed: %s", name, e)
+            return json.dumps({"error": f"{name} failed"})
+
+    async def ask(self, prompt: str, mode: str, thread: str | None, user_id: int) -> Reply:
+        model, previous_id = MODEL, None
+        parts = thread.split(":", 2) if thread else []
+        if len(parts) == 3 and PROVIDERS.get(parts[0]) and PROVIDERS[parts[0]].key:
+            t_provider, model, previous_id = parts  # continue on whatever model started the thread
+            if t_provider == "xai" and model != MODEL:
+                mode = "deep"
+        if mode in ("deep", "x") and not HAS_GROK:
+            mode = "auto"
+        if mode == "deep":
+            model = GROK_MODEL
+        provider = provider_for(model)
+
+        if mode == "deep":
+            tools = [{"type": "web_search"}, {"type": "x_search"}]
+        elif mode == "none":
+            tools = []
         else:
-            body["instructions"] = SYSTEM_PROMPT
-        if tools:
-            body["tools"] = tools
+            tools = [SEARCH_WEB] if TAVILY_API_KEY else []
+            if HAS_GROK and mode in ("auto", "x"):
+                tools.append(SEARCH_X)
 
-        reply = GrokReply()
-        tavily_urls: list[str] = []
+        def body_for(inputs: list[dict], prev: str | None, first: bool) -> dict:
+            body: dict = {"model": model, "input": inputs, "max_output_tokens": MAX_OUTPUT_TOKENS, "store": True}
+            if prev:
+                body["previous_response_id"] = prev
+            # OpenAI doesn't carry instructions over from previous_response_id; xAI refuses both together.
+            if provider.name == "openai" or not prev:
+                body["instructions"] = SYSTEM_PROMPT
+            if provider.name == "openai":
+                body["safety_identifier"] = hashlib.sha256(str(user_id).encode()).hexdigest()[:32]
+                if REASONING_EFFORT:
+                    body["reasoning"] = {"effort": REASONING_EFFORT}
+            else:
+                body["user"] = str(user_id)
+            if tools:
+                body["tools"] = tools
+                if first and mode == "x":
+                    body["tool_choice"] = {"type": "function", "name": "search_x"}
+            return body
+
+        reply = Reply()
+        x_used = [0]
+        body = body_for([{"role": "user", "content": prompt}], previous_id, True)
         for round_no in range(MAX_TOOL_ROUNDS + 1):
-            calls = absorb(reply, await self._post(body))
+            data = await self.post(provider, body)
+            text, calls = absorb(reply, model, data)
+            reply.thread = f"{provider.name}:{model}:{data.get('id')}"
+            if text:
+                reply.text = text
             if not calls:
                 break
-            outputs = []
-            for call in calls:
-                try:
-                    query = json.loads(call.get("arguments") or "{}").get("query", "")
-                    text, urls = await self.search(query)
-                    tavily_urls += urls
-                    reply.count("web")
-                except Exception as e:  # tell Grok, let it answer anyway
-                    log.warning("search failed: %s", e)
-                    text = json.dumps({"error": "search failed"})
-                outputs.append({"type": "function_call_output", "call_id": call["call_id"], "output": text})
-            body = {
-                "model": MODEL,
-                "previous_response_id": reply.response_id,
-                "input": outputs,
-                "max_output_tokens": MAX_OUTPUT_TOKENS,
-                "store": True,
-                "user": str(user_id),
-                "tools": tools,
-            }
+            outputs = [
+                {"type": "function_call_output", "call_id": c["call_id"], "output": await self.run_function(reply, c, x_used)}
+                for c in calls
+            ]
+            body = body_for(outputs, data.get("id"), False)
             if round_no == MAX_TOOL_ROUNDS - 1:
                 body["tool_choice"] = "none"  # last round: answer with what you have
 
-        # Prefer the URLs Grok cited; fall back to what our searches returned.
-        reply.citations = list(dict.fromkeys(reply.citations or tavily_urls))
+        # Prefer the URLs the model cited; fall back to what the web search returned.
+        reply.citations = list(dict.fromkeys(reply.citations or reply.searched_urls))
         reply.text = reply.text or "_(no answer)_"
         return reply
 
@@ -306,17 +425,17 @@ def split_message(text: str, limit: int = DISCORD_LIMIT) -> list[str]:
     return chunks
 
 
-def footer(reply: GrokReply) -> str:
+def footer(reply: Reply) -> str:
     parts = []
     if reply.citations:
         parts.append("**Sources:** " + " ".join(f"<{u}>" for u in reply.citations[:5]))
-    meta = []
+    meta = [" + ".join(reply.models)] if reply.models else []
     if reply.searches:
         meta.append("searched: " + ", ".join(f"{n} {k}" for k, n in reply.searches.items()))
     if SHOW_COST and reply.cost_usd:
         meta.append(f"${reply.cost_usd:.4f}")
     if meta:
-        parts.append(f"-# {MODEL} · " + " · ".join(meta))
+        parts.append("-# " + " · ".join(meta))
     return "\n".join(parts)
 
 
@@ -328,10 +447,10 @@ class GrokBot(discord.Client):
         )
         self.tree = app_commands.CommandTree(self)
         self.store = Store(DATA_DIR / "state" / "grokbot.db")
-        self.grok: Grok | None = None
+        self.assistant: Assistant | None = None
 
     async def setup_hook(self) -> None:
-        self.grok = Grok()
+        self.assistant = Assistant()
         self.loop.create_task(self.heartbeat())
         for gid in DEV_GUILD_IDS:
             guild = discord.Object(id=gid)
@@ -348,15 +467,18 @@ class GrokBot(discord.Client):
             await asyncio.sleep(30)
 
     async def close(self) -> None:
-        if self.grok:
-            await self.grok.aclose()
+        if self.assistant:
+            await self.assistant.aclose()
         await super().close()
 
     async def on_ready(self) -> None:
-        log.info("Logged in as %s (model %s, default search %s)", self.user, MODEL, DEFAULT_SEARCH)
+        log.info(
+            "Logged in as %s (model %s, grok for X: %s, web search: %s, default mode %s)",
+            self.user, MODEL, GROK_MODEL if HAS_GROK else "off", "tavily" if TAVILY_API_KEY else "off", DEFAULT_SEARCH,
+        )
 
-    async def answer(self, user_id: int, prompt: str, mode: str, previous_id: str | None) -> GrokReply:
-        reply = await self.grok.ask(prompt, mode, previous_id, user_id)
+    async def answer(self, user_id: int, prompt: str, mode: str, thread: str | None) -> Reply:
+        reply = await self.assistant.ask(prompt, mode, thread, user_id)
         self.store.record(user_id, reply.cost_usd)
         return reply
 
@@ -364,10 +486,10 @@ class GrokBot(discord.Client):
         if message.author.bot or not self.user:
             return
         ref = message.reference
-        previous_id = self.store.thread_for(ref.message_id) if ref and ref.message_id else None
+        thread = self.store.thread_for(ref.message_id) if ref and ref.message_id else None
         mentioned = self.user in message.mentions
         is_dm = isinstance(message.channel, discord.DMChannel)
-        if not (mentioned or previous_id or is_dm):
+        if not (mentioned or thread or is_dm):
             return
 
         prompt = message.content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "").strip()
@@ -379,29 +501,30 @@ class GrokBot(discord.Client):
 
         async with message.channel.typing():
             try:
-                reply = await self.answer(message.author.id, prompt, DEFAULT_SEARCH, previous_id)
+                reply = await self.answer(message.author.id, prompt, DEFAULT_SEARCH, thread)
             except Exception:
                 log.exception("ask failed")
-                await message.reply("Grok request failed, try again in a bit.", mention_author=False)
+                await message.reply("Request failed, try again in a bit.", mention_author=False)
                 return
 
         sent_ids, target = [], message
         for chunk in split_message(reply.text + "\n\n" + footer(reply)):
             target = await target.reply(chunk, mention_author=False, suppress_embeds=True)
             sent_ids.append(target.id)
-        self.store.remember(sent_ids, reply.response_id)
+        self.store.remember(sent_ids, reply.thread)
 
 
 bot = GrokBot()
 
 
-@bot.tree.command(name="ask", description="Ask Grok (searches the web when useful)")
-@app_commands.describe(question="What do you want to know?", search="How Grok may search")
+@bot.tree.command(name="ask", description="Ask the bot (searches the web, and X via Grok, when useful)")
+@app_commands.describe(question="What do you want to know?", search="How it may search")
 @app_commands.choices(
     search=[
-        app_commands.Choice(name="Web (default, cheap)", value="web"),
-        app_commands.Choice(name="Deep: xAI web + X search (pricier)", value="deep"),
-        app_commands.Choice(name="X / Twitter only (pricier)", value="x"),
+        app_commands.Choice(name="Auto: web, plus X via Grok when it matters (default)", value="auto"),
+        app_commands.Choice(name="Web only", value="web"),
+        app_commands.Choice(name="X via Grok", value="x"),
+        app_commands.Choice(name="Deep: Grok with xAI web + X search (pricier)", value="deep"),
         app_commands.Choice(name="No search (cheapest)", value="none"),
     ]
 )
@@ -416,7 +539,7 @@ async def ask_cmd(
         reply = await bot.answer(interaction.user.id, question, search.value if search else DEFAULT_SEARCH, None)
     except Exception:
         log.exception("ask failed")
-        await interaction.followup.send("Grok request failed, try again in a bit.")
+        await interaction.followup.send("Request failed, try again in a bit.")
         return
 
     header = f"> **{interaction.user.display_name}:** {question[:300]}\n\n"
@@ -424,10 +547,10 @@ async def ask_cmd(
     for chunk in split_message(header + reply.text + "\n\n" + footer(reply)):
         msg = await interaction.followup.send(chunk, suppress_embeds=True, wait=True)
         sent_ids.append(msg.id)
-    bot.store.remember(sent_ids, reply.response_id)
+    bot.store.remember(sent_ids, reply.thread)
 
 
-@bot.tree.command(name="grokusage", description="Show today's Grok spend")
+@bot.tree.command(name="grokusage", description="Show today's spend")
 async def usage_cmd(interaction: discord.Interaction) -> None:
     cap = f" of ${DAILY_BUDGET_USD:.2f}" if DAILY_BUDGET_USD else ""
     await interaction.response.send_message(
