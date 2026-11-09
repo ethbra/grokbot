@@ -7,6 +7,19 @@ A Discord bot that answers with a cheap, strong main model (OpenAI `gpt-6-luna` 
 - `/ask question:<text> search:<Auto | Web | X | Deep | None>`: ask a question.
 - `@grokbot <question>`, or a DM: same thing, in Auto mode.
 - Reply to any bot answer to continue that conversation. A reply continues on the same model that started the thread. Threads last 30 days.
+- Reply to **anyone's** message with `@grok is this true?` and the bot sees that message (and up to `REPLY_DEPTH` levels of the reply chain above it). A bare `@grok` reply works too.
+
+### What the bot sees
+
+With a mention, reply or DM, the bot also gets:
+- the last `CONTEXT_MESSAGES` (default 12) messages in the channel or thread, with display names and times, so "@grok is that right?" works without replying;
+- the message being replied to, and its reply chain;
+- the starter message of a thread or forum post;
+- images attached to the triggering message or the replied-to message (up to `MAX_IMAGES`, default 4), as vision input. Other files are listed by name only.
+
+When you reply to one of the bot's own answers, the stored conversation already has the earlier context, so the bot only adds the messages posted since that answer.
+
+All of this is passed as quoted data, separate from the instructions, and the model is told not to follow instructions inside it. It costs about 1–2k extra input tokens per answer, which is a fraction of a cent on Luna.
 - `/grokusage`: shows today's spend. Only you can see the reply.
 
 Each answer ends with up to 5 source links, the models used, which searches ran (with how many X posts were fetched), and what the answer cost.
@@ -81,6 +94,9 @@ These are environment variables. See `.env.example`.
 | `USER_COOLDOWN_S` | `5` | |
 | `MAX_OUTPUT_TOKENS` | `4000` | Reasoning tokens count toward this. |
 | `SEARCH_RESULTS` | `5` | Excerpts per web search. |
+| `CONTEXT_MESSAGES` | `12` | Recent channel messages sent with a mention. `0` turns it off. |
+| `REPLY_DEPTH` | `5` | How far up a reply chain to read. |
+| `MAX_IMAGES` | `4` | Images passed as vision input. `0` turns it off. |
 | `SHOW_COST` | `true` | |
 | `DEV_GUILD_IDS` | | |
 
@@ -88,6 +104,6 @@ These are environment variables. See `.env.example`.
 
 1. At https://discord.com/developers/applications, click **New Application**, open **Bot**, then **Reset Token**. The token goes into SOPS as `grokbot_discord_token`.
 2. Under **OAuth2 → URL Generator**, tick the `bot` and `applications.commands` scopes. For permissions, tick **View Channels**, **Send Messages**, **Send Messages in Threads** and **Read Message History**. Open the generated URL to invite the bot.
-3. No privileged intents are needed.
+3. Under **Bot → Privileged Gateway Intents**, turn on **Message Content Intent**. The bot requests it, and Discord refuses the connection without it. Verification only applies once the bot is in 100+ servers.
 
-Everything people send the bot goes to OpenAI (and to xAI when Grok is used), and search queries go to Tavily. Let your server members know.
+Everything people send the bot goes to OpenAI (and to xAI when Grok is used), and search queries go to Tavily. When someone mentions the bot, the recent messages in that channel go along too, including messages from people who never talked to the bot. Let your server members know.
