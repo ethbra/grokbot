@@ -602,7 +602,9 @@ class Assistant:
         if not reply.citations and "](" not in (reply.text or ""):
             reply.citations = reply.searched_urls[:3]
         reply.citations = list(dict.fromkeys(reply.citations))
-        reply.text = reply.text or "_(no answer)_"
+        # Masked links must be [text](<url>) so Discord doesn't unfurl a preview for each one;
+        # the model sometimes leaves the <> out.
+        reply.text = re.sub(r"\]\((https?://[^)\s<>]+)\)", r"](<\1>)", reply.text or "") or "_(no answer)_"
         return reply
 
     async def summarize(self, text: str) -> tuple[str, float]:
