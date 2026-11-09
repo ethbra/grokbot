@@ -28,7 +28,7 @@ import os
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import discord
@@ -50,11 +50,16 @@ REASONING_EFFORT = os.getenv("REASONING_EFFORT", "")
 MODEL_PRICE = os.getenv("MODEL_PRICE", "")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    "You are a helpful assistant chatting in a Discord server. Be concise and use Discord markdown. "
+    "You are Grok, the AI of X, the everything app, chatting in a Discord server. Be witty, direct and a "
+    "little irreverent, but never at the expense of accuracy. Be concise and use Discord markdown.\n\n"
     "When a question needs current or factual information you are unsure of, use search_web first. "
-    "Use search_x only when X/Twitter itself matters: what people are posting or saying right now, "
-    "reactions to breaking news, or posts by specific accounts. It costs more, so don't use it for "
-    "ordinary facts. Cite the sources you used.",
+    "Use search_x when X itself matters: what people are posting or saying right now, reactions to "
+    "news, or what a specific account posted. When the question names accounts, pass their handles. "
+    "It costs more, so don't use it for ordinary facts.\n\n"
+    "Report X results as they are, with post dates; if they're thin or old, say so plainly. "
+    "Cite the sources you used.\n\n"
+    "If someone sincerely asks what model you run on, be honest: this bot uses several models, and "
+    "the footer of each answer lists the ones used.",
 )
 DEFAULT_SEARCH = os.getenv("DEFAULT_SEARCH", "auto")
 # Spending guards (USD). 0 disables a limit.
@@ -108,8 +113,22 @@ SEARCH_WEB = fn("search_web", "Search the web for current information. Returns t
 SEARCH_X = fn(
     "search_x",
     "Search posts on X (Twitter): what people are saying now, reactions to news, posts by specific "
-    "accounts. Returns a summary with post links. Expensive: only when X itself is relevant.",
+    "accounts. Returns dated posts with links, newest first. Expensive: only when X itself is relevant.",
 )
+SEARCH_X["parameters"]["properties"].update({
+    "handles": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Only posts from these X accounts, without @ (e.g. elonmusk). Returns their newest "
+        "posts, with query as the focus. Omit to search everyone.",
+    },
+    "days": {"type": "integer", "description": "Only posts from the last N days. Omit for no limit."},
+})
+
+
+def today_line() -> str:
+    now = datetime.now().astimezone()  # the container's TZ
+    return f"It is now {now:%A, %B %d, %Y, %H:%M} {now.tzname()}."
 
 
 # --------------------------------------------------------------------------- providers
@@ -139,6 +158,9 @@ HAS_GROK = bool(XAI_API_KEY)
 
 
 def token_cost(model: str, usage: dict) -> float:
+    # xAI reports its exact cost (tokens plus server-side tools): 1 tick = 1e-10 USD.
+    if usage.get("cost_in_usd_ticks") is not None:
+        return usage["cost_in_usd_ticks"] / 1e10
     if usage.get("cost_in_nano_usd") is not None:
         return usage["cost_in_nano_usd"] / 1e9
     price = PRICES.get(model)
@@ -235,6 +257,7 @@ class Reply:
     searches: dict[str, int] = field(default_factory=dict)
     models: list[str] = field(default_factory=list)
     searched_urls: list[str] = field(default_factory=list)
+    x_posts: int = 0
 
     def count(self, kind: str, n: int = 1) -> None:
         if n:
@@ -270,6 +293,7 @@ def absorb(reply: Reply, model: str, data: dict) -> tuple[str, list[dict]]:
     tools = usage.get("server_side_tool_usage_details") or {}
     reply.count("xAI web", tools.get("web_search_calls") or 0)
     reply.count("X", tools.get("x_search_calls") or 0)
+    reply.x_posts += tools.get("x_posts_fetched") or 0
     return "".join(texts).strip(), calls
 
 
@@ -303,19 +327,34 @@ class Assistant:
         reply.searched_urls += [x["url"] for x in results if x.get("url")]
         return json.dumps(results, ensure_ascii=False)
 
-    async def search_x(self, reply: Reply, query: str) -> str:
+    async def search_x(self, reply: Reply, query: str, handles: list[str] | None = None, days: int | None = None) -> str:
         """Hand the X part to Grok and return its summary to the main model."""
+        tool: dict = {"type": "x_search"}
+        handles = [h.strip().lstrip("@") for h in handles or [] if h and h.strip()][:10]
+        if handles:
+            tool["allowed_x_handles"] = handles
+        if days and days > 0:
+            tool["from_date"] = (date.today() - timedelta(days=min(days, 365))).isoformat()
+        if handles:
+            # A keyword search inside an account's own posts often finds nothing, so ask for the
+            # newest posts and use the query only as focus.
+            task = (f"Find the newest posts from {', '.join('@' + h for h in handles)}. Prefer ones about: "
+                    f"{query}. If none match that, list their newest posts anyway.")
+        else:
+            task = f"Search X for posts about: {query}"
         data = await self.post(
             PROVIDERS["xai"],
             {
                 "model": GROK_MODEL,
                 "input": [{
                     "role": "user",
-                    "content": f"Search X for: {query}\n\nReport what the relevant posts say: handle, date, "
-                    "the gist, and the post URL. Be concise and factual. Say so if nothing relevant turned up.",
+                    "content": f"{today_line()} {task}\n\n"
+                    "List the relevant posts, newest first: handle, exact date, whether it is a repost or "
+                    "reply, the gist (quote short key phrases), and the post URL. Be concise and factual. "
+                    "If the newest relevant post is old, say how old. Say so if nothing relevant turned up.",
                 }],
-                "tools": [{"type": "x_search"}],
-                "max_output_tokens": 1200,
+                "tools": [tool],
+                "max_output_tokens": 1500,
                 "store": False,
             },
         )
@@ -323,19 +362,27 @@ class Assistant:
         text, _ = absorb(reply, GROK_MODEL, data)
         if reply.searches.get("X", 0) == before:
             reply.count("X")
+        log.info("search_x %r handles=%s days=%s -> %d posts, %d chars", query[:80], handles, days, reply.x_posts, len(text))
         return text or "No results."
 
     async def run_function(self, reply: Reply, call: dict, x_used: list[int]) -> str:
         name = call.get("name")
         try:
-            query = json.loads(call.get("arguments") or "{}").get("query", "")
+            args = json.loads(call.get("arguments") or "{}")
+            query = args.get("query", "")
             if name == "search_web":
                 return await self.search_web(reply, query)
             if name == "search_x":
                 if x_used[0] >= X_SEARCHES_PER_ANSWER:
                     return json.dumps({"error": "X search limit for this answer reached; answer with what you have"})
                 x_used[0] += 1
-                return await self.search_x(reply, query)
+                handles = args.get("handles")
+                days = args.get("days")
+                return await self.search_x(
+                    reply, query,
+                    handles if isinstance(handles, list) else None,
+                    days if isinstance(days, int) else None,
+                )
             return json.dumps({"error": f"unknown function {name}"})
         except Exception as e:  # tell the model, let it answer anyway
             log.warning("%s failed: %s", name, e)
@@ -369,7 +416,7 @@ class Assistant:
                 body["previous_response_id"] = prev
             # OpenAI doesn't carry instructions over from previous_response_id; xAI refuses both together.
             if provider.name == "openai" or not prev:
-                body["instructions"] = SYSTEM_PROMPT
+                body["instructions"] = f"{SYSTEM_PROMPT}\n\n{today_line()}"
             if provider.name == "openai":
                 body["safety_identifier"] = hashlib.sha256(str(user_id).encode()).hexdigest()[:32]
                 if REASONING_EFFORT:
@@ -431,7 +478,10 @@ def footer(reply: Reply) -> str:
         parts.append("**Sources:** " + " ".join(f"<{u}>" for u in reply.citations[:5]))
     meta = [" + ".join(reply.models)] if reply.models else []
     if reply.searches:
-        meta.append("searched: " + ", ".join(f"{n} {k}" for k, n in reply.searches.items()))
+        meta.append("searched: " + ", ".join(
+            f"{n} {k}" + (f" ({reply.x_posts} posts)" if k == "X" and reply.x_posts else "")
+            for k, n in reply.searches.items()
+        ))
     if SHOW_COST and reply.cost_usd:
         meta.append(f"${reply.cost_usd:.4f}")
     if meta:

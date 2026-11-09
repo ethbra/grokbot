@@ -9,14 +9,16 @@ A Discord bot that answers with a cheap, strong main model (OpenAI `gpt-6-luna` 
 - Reply to any bot answer to continue that conversation. A reply continues on the same model that started the thread. Threads last 30 days.
 - `/grokusage`: shows today's spend. Only you can see the reply.
 
-Each answer ends with up to 5 source links, the models used, which searches ran, and what the answer cost.
+Each answer ends with up to 5 source links, the models used, which searches ran (with how many X posts were fetched), and what the answer cost.
+
+The default system prompt has the bot answer in character as Grok, the AI of X, whichever model is answering. If someone sincerely asks which model it runs on, it says the bot uses several models and points to the footer. Set `SYSTEM_PROMPT` to replace the prompt. The current date and time (the container's `TZ`) are added to every request, so "latest" and "today" mean something.
 
 ### How it decides when to use Grok
 
 There is no separate routing model. The main model gets two functions and decides when to call them, based on their descriptions and the system prompt:
 
 - `search_web`: the bot runs a Tavily search and returns 5 short excerpts.
-- `search_x`: the bot hands the query to Grok with xAI's `x_search`. Grok returns a summary with post links, and the main model writes the answer. This is offered only when `XAI_API_KEY` is set, and it is capped at `X_SEARCHES_PER_ANSWER` (default 1) per answer, because xAI bills X search per post fetched.
+- `search_x`: the bot hands the query to Grok with xAI's `x_search`. The model can pass `handles` (only these accounts; returns their newest posts) and `days` (only recent posts). Grok returns a summary with post links, and the main model writes the answer. This is offered only when `XAI_API_KEY` is set, and it is capped at `X_SEARCHES_PER_ANSWER` (default 1) per answer, because xAI bills X search per post fetched.
 
 So "is it true JFK died in 1962?" costs one cheap web search. "What are people on X saying about the launch?" also brings in Grok.
 
