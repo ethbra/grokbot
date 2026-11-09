@@ -8,7 +8,60 @@ A Discord bot that answers with a cheap, strong main model (OpenAI `gpt-6-luna` 
 - `@grokbot <question>`, or a DM: same thing, in Auto mode.
 - Reply to any bot answer to continue that conversation. A reply continues on the same model that started the thread. Threads last 30 days.
 - Reply to **anyone's** message with `@grok is this true?` and the bot sees that message, verbatim, and the reply chain above it (up to `REPLY_DEPTH`, default 25, messages). A bare `@grok` reply works too.
+- After the bot answers you in a server channel, you can follow up for 2 minutes **without** an @ or a reply ("ok but what about 1944?"). See [Follow-ups without @](#follow-ups-without-).
 - `/grokusage`: shows today's spend. Only you can see the reply.
+- `/grokinterject on | off | status`: turns follow-ups without @ on or off for the current channel (needs Manage Channels; `status` is open to anyone who can see the command).
+
+### Follow-ups without @
+
+The person the bot last answered in a channel (by @mention, reply or `/ask`) can keep talking to it for `INTERJECT_WINDOW_S` (default 120 s) without an @. Only that person, only in that channel, and at most `INTERJECT_MAX_CHAIN` (default 2) unprompted answers in a row. An @mention or reply resets the count. It is on by default in every channel (`INTERJECT_DEFAULT`); `/grokinterject off` turns it off for a channel.
+
+**The decision is made on the box.** A message that doesn't @mention or reply to the bot is never sent to OpenAI, xAI or Tavily unless the local check says yes, and the bot shows no typing indicator before then. The check works like this:
+
+1. **Hard skips**, which cost nothing. The bot ignores the message if:
+   - it isn't from the last asker;
+   - the window has passed, or the chain is used up;
+   - it @mentions or replies to someone else, a role or @everyone;
+   - two or more other people have spoken since the answer, or someone talked to the asker (this closes the conversation);
+   - it is only a link, emoji or attachment, longer than 400 characters, or a bare "thanks" / "ok" / "lol";
+   - the channel is muted.
+2. **Score.** The bot adds up these signals:
+
+   | Signal | Points |
+   |---|---|
+   | Starts with "but / and / so / wait / what about / what if / why" | +3 |
+   | Contains `?` | +2 |
+   | Contains "you / u / ur / your" | +2 |
+   | Addresses the bot by name ("grok, ...") | +3 |
+   | Talks about the bot in the third person ("grok is ...", "ask grok") | -3 |
+   | Within 45 s of the answer | +2 |
+   | 15 words or fewer | +1 |
+   | Someone else spoke in between | -3 |
+   | Someone else spoke last | -2 |
+   | Per earlier unprompted answer in the chain | -1 |
+
+3. **Local model.** This step runs only when `OLLAMA_URL` is set, and only for scores of 5 or more. The bot sends the last 6 messages in the channel to a small model on a local Ollama (`INTERJECT_MODEL`, default Qwen2.5 1.5B). Speakers are relabelled Grok / User A / User B and each message is cut to 300 characters. The model answers yes or no.
+4. **Decision.**
+
+   | Setup | Answers when |
+   |---|---|
+   | Local model configured | The score is 5 or more and the model says yes |
+   | Model configured, but it fails or takes longer than `INTERJECT_TIMEOUT_S` | The score is 8 or more |
+   | No model configured | The score is 8 or more |
+
+   At most `INTERJECT_PER_CHANNEL_HOUR` (default 6) unprompted answers go out per channel per hour.
+
+A yes goes through the normal answer path: spend caps, stored history, and continuing the model thread of the answer being followed up on. The asker never sees a refusal: when a cap is hit, the bot just stays quiet.
+
+**Telling it to back off.** React with 🤫 or 🔇 to an unprompted answer, or say something like "not you grok" or "shut up grok" within 10 minutes of one. Either closes the conversation and mutes unprompted answers in that channel for 30 minutes. @mentions keep working.
+
+**Decision log.** Each message from the current asker gets a row in `interject_log` in `grokbot.db`. The row holds ids, the score and the signals that fired, the skip reason, the model's verdict and latency, and the decision. It never holds message text. Rows are labelled later:
+- `false_positive` when the bot was told to back off;
+- `missed` when the asker @mentioned the bot within 90 s of a skip.
+
+Rows are deleted after 30 days. `docker logs grokbot` shows one `interject ...` line for each candidate (score 5 or more).
+
+The local model runs in Ollama in grokbot's network namespace (`network_mode: "service:grokbot"` in the homelab stack), so the bot reaches it at `http://127.0.0.1:11434` and no port is published. At startup the bot asks Ollama to pull `INTERJECT_MODEL` in the background and retries with backoff until Ollama is up; until then the strict heuristic decides.
 
 ### What the bot sees
 
@@ -65,7 +118,7 @@ homelab:   signed commit bumping the tag in stacks/grokbot/compose.yaml
 Svalbard:  homelab-pull applies it; the container connects out to Discord, OpenAI, xAI and Tavily
 ```
 
-The bot only makes outbound connections (to Discord, OpenAI, xAI and Tavily), so it needs no DNS, tunnel, nginx route or open port. Secrets live in the homelab repo's SOPS file (`grokbot_discord_token`, `grokbot_openai_api_key`, `grokbot_xai_api_key`, `grokbot_tavily_api_key`). The stacks role writes them to a root-only `.env` on the box. State (`grokbot.db`) is in `/srv/appdata/grokbot/state/`.
+The bot only makes outbound connections (to Discord, OpenAI, xAI and Tavily, plus the local Ollama on `127.0.0.1` when `OLLAMA_URL` is set), so it needs no DNS, tunnel, nginx route or open port. Secrets live in the homelab repo's SOPS file (`grokbot_discord_token`, `grokbot_openai_api_key`, `grokbot_xai_api_key`, `grokbot_tavily_api_key`). The stacks role writes them to a root-only `.env` on the box. State (`grokbot.db`) is in `/srv/appdata/grokbot/state/`.
 
 ### Releasing
 
@@ -113,6 +166,13 @@ These are environment variables. See `.env.example`.
 | `REPLY_DEPTH` | `25` | How far up a reply chain to read. `0` turns it off. |
 | `MAX_IMAGES` | `4` | Images passed as vision input. `0` turns it off. |
 | `SHOW_DETAILS` | `false` | `true` adds a line under each answer with the models used, searches run and cost. Either way, each answer's details are logged (`docker logs grokbot`). |
+| `INTERJECT_DEFAULT` | `on` | Follow-ups without @ in channels that haven't been set with `/grokinterject`. |
+| `INTERJECT_WINDOW_S` | `120` | How long after an answer the asker can follow up without @. |
+| `INTERJECT_MAX_CHAIN` | `2` | Unprompted answers in a row before an @ is needed again. |
+| `INTERJECT_PER_CHANNEL_HOUR` | `6` | Unprompted answers per channel per hour. `0` means no limit. |
+| `OLLAMA_URL` | (empty) | Local Ollama for the yes/no check, e.g. `http://127.0.0.1:11434`. Empty: heuristics only (score of 8 or more). |
+| `INTERJECT_MODEL` | `qwen2.5:1.5b-instruct-q4_K_M` | Pulled into Ollama at startup. |
+| `INTERJECT_TIMEOUT_S` | `5` | Longer than this and the strict heuristic decides. |
 | `DEV_GUILD_IDS` | | |
 
 ## Discord application setup
@@ -121,4 +181,6 @@ These are environment variables. See `.env.example`.
 2. Under **OAuth2 → URL Generator**, tick the `bot` and `applications.commands` scopes. For permissions, tick **View Channels**, **Send Messages**, **Send Messages in Threads** and **Read Message History**. Open the generated URL to invite the bot.
 3. Under **Bot → Privileged Gateway Intents**, turn on **Message Content Intent**. The bot requests it, and Discord refuses the connection without it. Verification only applies once the bot is in 100+ servers.
 
-Everything people send the bot goes to OpenAI (and to xAI when Grok is used), and search queries go to Tavily. When someone mentions the bot, the messages in the reply chain they replied to go along too, with display names, even if those people never talked to the bot. Raw channel messages are no longer sent by default (`CONTEXT_MESSAGES=0`). The bot stores, for 24 hours in `/data/state/grokbot.db`, anonymized summaries of the questions it was asked and its own answers (see [Stored history and retention](#stored-history-and-retention)), plus per-user daily spend and the IDs of its own reply messages for conversation threading. Let your server members know.
+Reactions need no extra setup: the reactions intent is part of the default intents, and reading reactions needs no extra permission.
+
+Everything people send the bot goes to OpenAI (and to xAI when Grok is used), and search queries go to Tavily. Messages that don't @mention or reply to the bot are judged on the box: by heuristics, and by the local Ollama model when one is configured. They are never sent out unless that check decides the bot should answer; then the message is answered like a mention. When someone mentions the bot, the messages in the reply chain they replied to go along too, with display names, even if those people never talked to the bot. Raw channel messages are no longer sent by default (`CONTEXT_MESSAGES=0`). The bot stores, for 24 hours in `/data/state/grokbot.db`, anonymized summaries of the questions it was asked and its own answers (see [Stored history and retention](#stored-history-and-retention)), plus per-user daily spend and the IDs of its own reply messages for conversation threading. Let your server members know.

@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 import discord
@@ -151,6 +152,23 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", "/tmp/grokbot-heartbeat"))
 # Optional: comma-separated guild IDs for instant slash-command sync while testing.
 DEV_GUILD_IDS = [int(g) for g in os.getenv("DEV_GUILD_IDS", "").split(",") if g.strip()]
+# Follow-ups without an @ ("interjecting"). Decided locally: heuristics, then optionally a small
+# model on a local Ollama. A message that doesn't pass never leaves the box.
+INTERJECT_DEFAULT = os.getenv("INTERJECT_DEFAULT", "on").lower() in ("on", "true", "1", "yes")
+INTERJECT_WINDOW_S = float(os.getenv("INTERJECT_WINDOW_S", "120"))
+INTERJECT_MAX_CHAIN = int(os.getenv("INTERJECT_MAX_CHAIN", "2"))
+INTERJECT_PER_CHANNEL_HOUR = int(os.getenv("INTERJECT_PER_CHANNEL_HOUR", "6"))
+OLLAMA_URL = os.getenv("OLLAMA_URL", "").rstrip("/")  # empty: heuristics only
+INTERJECT_MODEL = os.getenv("INTERJECT_MODEL", "qwen2.5:1.5b-instruct-q4_K_M")
+INTERJECT_TIMEOUT_S = float(os.getenv("INTERJECT_TIMEOUT_S", "5"))
+INTERJECT_CANDIDATE = 5  # score that makes a message a candidate (asks the local model, if any)
+INTERJECT_STRICT = 8  # score that answers on heuristics alone (no model, or the model failed)
+INTERJECT_MAX_CHARS = 400
+INTERJECT_CONTEXT = 6  # cached messages shown to the local model, the judged one included
+INTERJECT_MUTE_S = 30 * 60
+INTERJECT_SHUSH_WINDOW_S = 10 * 60  # "shut up grok" counts this long after an interjection
+INTERJECT_LOG_TTL_S = 30 * 86400
+MUTE_EMOJI = ("\N{FACE WITH FINGER COVERING CLOSED LIPS}", "\N{SPEAKER WITH CANCELLATION STROKE}")
 
 TAVILY_URL = "https://api.tavily.com/search"
 DISCORD_LIMIT = 2000
@@ -281,9 +299,20 @@ class Store:
                 text TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS history_by_channel ON history (channel_id, created);
             CREATE TABLE IF NOT EXISTS history_salt (epoch INTEGER PRIMARY KEY, salt BLOB NOT NULL);
+            CREATE TABLE IF NOT EXISTS channel_settings (
+                channel_id INTEGER PRIMARY KEY, interject INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS interject_log (  -- no message text, ever
+                ts REAL NOT NULL, channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                author_id INTEGER NOT NULL, score INTEGER, features TEXT NOT NULL,
+                reason TEXT NOT NULL,    -- a skip reason, or 'scored'
+                llm TEXT NOT NULL,       -- yes | no | error | off | '' (not asked)
+                llm_ms INTEGER, decision TEXT NOT NULL,  -- answer | skip | capped | muted
+                label TEXT);             -- missed | false_positive, filled in later
+            CREATE INDEX IF NOT EXISTS interject_log_by_channel ON interject_log (channel_id, ts);
             """
         )
         self.db.execute("DELETE FROM threads WHERE created < ?", (time.time() - THREAD_TTL_S,))
+        self.db.execute("DELETE FROM interject_log WHERE ts < ?", (time.time() - INTERJECT_LOG_TTL_S,))
         self.prune()
         self.last_call: dict[int, float] = {}
         self._salt: tuple[int, bytes] | None = None
@@ -391,6 +420,48 @@ class Store:
             (message_id, time.time() - THREAD_TTL_S),
         ).fetchone()
         return row[0] if row else None
+
+    # ---- interjection settings and decision log
+
+    def interject_enabled(self, channel_id: int) -> bool:
+        row = self.db.execute("SELECT interject FROM channel_settings WHERE channel_id = ?", (channel_id,)).fetchone()
+        return INTERJECT_DEFAULT if row is None else bool(row[0])
+
+    def set_interject(self, channel_id: int, on: bool) -> None:
+        self.db.execute("INSERT OR REPLACE INTO channel_settings VALUES (?, ?)", (channel_id, int(on)))
+        self.db.commit()
+
+    def log_interject(
+        self, *, channel_id: int, message_id: int, author_id: int, score: int | None, features: str,
+        reason: str, llm: str = "", llm_ms: int | None = None, decision: str = "skip",
+    ) -> int:
+        now = time.time()
+        cur = self.db.execute(
+            "INSERT INTO interject_log VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            (now, channel_id, message_id, author_id, score, features, reason, llm, llm_ms, decision),
+        )
+        self.db.execute("DELETE FROM interject_log WHERE ts < ?", (now - INTERJECT_LOG_TTL_S,))
+        self.db.commit()
+        return cur.lastrowid
+
+    def set_decision(self, rowid: int, decision: str) -> None:
+        self.db.execute("UPDATE interject_log SET decision = ? WHERE rowid = ?", (decision, rowid))
+        self.db.commit()
+
+    def label_interject(self, rowid: int, label: str) -> None:
+        self.db.execute("UPDATE interject_log SET label = ? WHERE rowid = ?", (label, rowid))
+        self.db.commit()
+
+    def label_missed(self, channel_id: int, author_id: int, since: float) -> None:
+        """The asker @mentioned the bot soon after a message it decided not to answer: that
+        skip was probably a miss."""
+        row = self.db.execute(
+            "SELECT rowid FROM interject_log WHERE channel_id = ? AND author_id = ? AND ts >= ? "
+            "AND decision = 'skip' AND label IS NULL ORDER BY ts DESC LIMIT 1",
+            (channel_id, author_id, since),
+        ).fetchone()
+        if row:
+            self.label_interject(row[0], "missed")
 
 
 # --------------------------------------------------------------------------- model calls
@@ -924,23 +995,27 @@ class Built:
 
 
 async def build_prompt(
-    message: discord.Message, me: discord.abc.User, question: str, continuing: bool, store: Store | None = None
+    message: discord.Message, me: discord.abc.User, question: str, continuing: bool, store: Store | None = None,
+    anchor: discord.Message | None = None, interjected: bool = False,
 ) -> Built:
     """The question plus Discord context, as Responses API content.
 
     continuing: the message replies to one of our answers, so the stored thread already holds that
     conversation (and the reply chain and images it was asked with). Then only history and messages
     from after that answer are added.
+    anchor: the answer being continued when the message isn't a reply to it (an interjection).
+    interjected: the message is a follow-up without an @mention.
     """
     channel = message.channel
     parent = await fetch_parent(channel, message)
-    after = parent.created_at.timestamp() if continuing and parent else None
+    since_msg = anchor if anchor is not None else parent
+    after = since_msg.created_at.timestamp() if continuing and since_msg else None
     chain = [] if continuing or REPLY_DEPTH <= 0 else await reply_chain(channel, message, REPLY_DEPTH)
 
     recent: list[discord.Message] = []
     if CONTEXT_MESSAGES > 0:
         try:
-            since = discord.Object(id=parent.id) if continuing and parent else None
+            since = discord.Object(id=since_msg.id) if continuing and since_msg else None
             recent = [
                 m async for m in channel.history(
                     limit=CONTEXT_MESSAGES, before=message, after=since, oldest_first=False
@@ -972,11 +1047,176 @@ async def build_prompt(
     images = await images_of([message, *chain[:1]]) if MAX_IMAGES > 0 else []
     if not question:
         question = "(no text, just a ping) Respond to the message they replied to, or to the recent conversation."
-    asker = f"{message.author.display_name} asks: {question}"
+    if interjected:
+        asker = f"{message.author.display_name} follows up on your last answer (no @mention): {question}"
+    else:
+        asker = f"{message.author.display_name} asks: {question}"
     is_dm = isinstance(channel, discord.DMChannel)
     shown = [message, *chain, *recent, *([starter] if starter else []), *([parent] if parent else [])]
     people = [u for m in shown for u in (m.author, *getattr(m, "mentions", []))]
     return Built(compose(sections, asker, images, is_dm), parent, chain, people)
+
+
+# --------------------------------------------------------------------------- interjection (local only)
+#
+# After the bot answers someone in a guild channel, that person may follow up for a short window
+# without an @mention or reply. Everything here runs on the box: free heuristics first, then, for
+# candidates only, a small model on a local Ollama. Nothing about a message that doesn't pass is
+# sent to OpenAI, xAI or Tavily, and there is no typing indicator before the decision.
+
+
+@dataclass
+class Convo:
+    """The open conversation in one channel: who asked last and the answer they got."""
+    user_id: int
+    answer: discord.Message  # first message of the bot's latest answer (its stored thread)
+    answered_at: float
+    chain: int = 0  # unprompted answers since the last @mention, reply or /ask
+    others: int = 0  # messages from other people since that answer
+    last_other: bool = False  # the newest message before this one was someone else's
+    busy: bool = False  # a decision or answer for this conversation is in flight
+
+
+_URL = re.compile(r"https?://\S+")
+_CUSTOM_EMOJI = re.compile(r"<a?:\w+:\d+>")
+_CONTINUATION = re.compile(
+    r"^(?:(?:ok|okay|hm+|wait|so)[,.]?\s+)?(?:but|and|so|also|wait|then|why|what about|how about|what if)\b", re.I
+)
+_SECOND_PERSON = re.compile(r"\b(?:you|u|ur|your|yours|you're|youre|ya|yourself)\b", re.I)
+_ACK = re.compile(
+    r"^(?:thanks?|thank you|thx|ty|tysm|ok|okay|k+|lol|lmao|lmfao|rofl|nice|cool|great|got it|bet|fair|"
+    r"true|yep|yup|yes|yeah|no|nah|nope|ha(?:ha)+|based|damn|wow|word|good bot|bad bot|interesting|"
+    r"makes sense|fair enough|i see)(?: (?:thanks?|lol|man|bro|dude))?$",
+    re.I,
+)
+_SHUT_UP = re.compile(
+    r"\b(?:not you|shut up|stfu|shush|hush|nobody asked|go away|be quiet|not talking to you|"
+    r"wasn'?t talking to you|didn'?t ask you)\b",
+    re.I,
+)
+_THIRD_PERSON_VERBS = (
+    r"is|was|isn'?t|wasn'?t|said|says|thinks|can'?t|cant|can|doesn'?t|doesnt|does|did|has|had|got|just|"
+    r"keeps|always|never|will|would|literally|really|seems|sucks|lies|lied|knows|told|gave|answered"
+)
+
+
+def name_pattern(names: set[str]) -> str:
+    return "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True) if n)
+
+
+def visible_text(text: str) -> str:
+    """The message without links, custom emoji and mentions."""
+    return re.sub(r"<[@#][!&]?\d+>", " ", _CUSTOM_EMOJI.sub(" ", _URL.sub(" ", text))).strip()
+
+
+def is_ack(text: str, names: set[str]) -> bool:
+    """A bare "thanks" / "ok" / "lol" (with or without the bot's name)."""
+    t = text.lower()
+    if names:
+        t = re.sub(rf"(?<!\w)@?(?:{name_pattern(names)})(?!\w)", " ", t)
+    t = " ".join(re.sub(r"[^\w\s']", " ", t).split())
+    return bool(_ACK.match(t))
+
+
+def interject_score(
+    text: str, names: set[str], since_answer_s: float, others: int, last_other: bool, chain: int,
+    reply_to_bot: bool = False,
+) -> tuple[int, list[str]]:
+    """Heuristic score for "this follow-up is meant for the bot", and the signals that fired."""
+    t = " ".join(text.split())
+    score, feats = 0, []
+
+    def add(points: int, tag: str) -> None:
+        nonlocal score
+        score += points
+        feats.append(f"{tag}{points:+d}")
+
+    if _CONTINUATION.match(t):
+        add(3, "cont")
+    if "?" in t:
+        add(2, "q")
+    if _SECOND_PERSON.search(t):
+        add(2, "you")
+    if names:
+        n = name_pattern(names)
+        third = re.search(rf"(?<!\w)(?:{n})(?:'s\b|\s+(?:{_THIRD_PERSON_VERBS})\b)", t, re.I) or re.search(
+            rf"\b(?:ask|asked|tell|told|the|this|that|like|about|thinks|says)\s+@?(?:{n})(?!\w)", t, re.I
+        )
+        vocative = re.match(rf"^(?:(?:hey|yo|ok|okay|oi|so)[,\s]+)?@?(?:{n})(?!\w)", t, re.I) or re.search(
+            rf"[,\s]@?(?:{n})\s*[?!.]*$", t, re.I
+        )
+        if third:
+            add(-3, "third")
+        elif vocative:
+            add(3, "name")
+    if reply_to_bot:
+        add(3, "reply")
+    if since_answer_s < 45:
+        add(2, "recent")
+    if len(t.split()) <= 15:
+        add(1, "short")
+    if others:
+        add(-3, "others")
+    if last_other:
+        add(-2, "lastother")
+    if chain:
+        add(-chain, "chain")
+    return score, feats
+
+
+INTERJECT_SYSTEM = (
+    "You judge one thing: is the LAST message in a Discord group chat addressed to Grok, an AI "
+    "assistant bot, and does it expect Grok to reply? Grok answered someone shortly before. A "
+    "follow-up question or comment to Grok's answer counts as addressed to Grok. It is NOT "
+    "addressed to Grok if it talks to another person, talks about Grok instead of to it, or is "
+    "just a reaction. If unsure, answer false. Reply with JSON: {\"addressed\": true} or "
+    "{\"addressed\": false}."
+)
+INTERJECT_FORMAT = {
+    "type": "object",
+    "properties": {"addressed": {"type": "boolean"}},
+    "required": ["addressed"],
+}
+
+
+def interject_transcript(msgs: list, me_id: int) -> str:
+    """The last messages for the local model, speakers relabelled Grok / User A / User B, each
+    cut to 300 chars. The last one is the message being judged."""
+    labels: dict[int, str] = {}
+    names: dict[str, str] = {}
+
+    def label(user) -> str:
+        if user.id == me_id:
+            lab = "Grok"
+        else:
+            lab = labels.setdefault(user.id, f"User {chr(ord('A') + len(labels) % 26)}")
+        for attr in ("display_name", "global_name", "name"):
+            n = getattr(user, attr, None)
+            if isinstance(n, str) and n.strip():
+                names.setdefault(n.strip(), lab)
+        return lab
+
+    for m in msgs:  # label everyone first, so names in the text can be swapped too
+        label(m.author)
+        for u in getattr(m, "mentions", []) or []:
+            label(u)
+    pattern = re.compile(rf"(?<!\w)@?({name_pattern(set(names))})(?!\w)", re.I) if names else None
+    lookup = {n.lower(): lab for n, lab in names.items()}
+    lines = []
+    for i, m in enumerate(msgs):
+        text = m.clean_content or ""
+        if m.author.id == me_id:
+            text = _without_footer(text)
+        if pattern:
+            text = pattern.sub(lambda x: "@" + lookup.get(x.group(1).lower(), "someone"), text)
+        text = _SNOWFLAKE.sub("[id]", text).replace("\n", " / ")
+        if len(text) > 300:
+            text = text[:300] + "..."
+        parent = m.reference.resolved if getattr(m, "reference", None) else None
+        to = f" (replying to {label(parent.author)})" if isinstance(parent, discord.Message) else ""
+        head = "LAST MESSAGE, from " if i == len(msgs) - 1 else ""
+        lines.append(f"{head}{label(m.author)}{to}: {text or '(no text)'}")
+    return "\n".join(lines)
 
 
 class GrokBot(discord.Client):
@@ -990,6 +1230,13 @@ class GrokBot(discord.Client):
         self.store = Store(DATA_DIR / "state" / "grokbot.db")
         self.assistant: Assistant | None = None
         self.background: set[asyncio.Task] = set()
+        # Interjection state, in memory only (lost on restart, which just closes conversations).
+        self.local: httpx.AsyncClient | None = None  # Ollama on the box; never a third party
+        self.convos: dict[int, Convo] = {}  # channel id -> open conversation
+        self.muted_until: dict[int, float] = {}  # channel id -> time
+        self.interjected: dict[int, tuple[int, int]] = {}  # answer message id -> (channel id, log row)
+        self.last_interjection: dict[int, float] = {}  # channel id -> time
+        self.interjection_times: dict[int, list[float]] = {}  # channel id -> times, last hour
 
     def spawn(self, coro) -> asyncio.Task:
         task = asyncio.get_running_loop().create_task(coro)
@@ -1000,6 +1247,8 @@ class GrokBot(discord.Client):
     async def setup_hook(self) -> None:
         self.assistant = Assistant()
         self.loop.create_task(self.heartbeat())
+        if OLLAMA_URL:
+            self.spawn(self.pull_model())  # in the background: never blocks startup
         for gid in DEV_GUILD_IDS:
             guild = discord.Object(id=gid)
             self.tree.copy_global_to(guild=guild)
@@ -1017,6 +1266,8 @@ class GrokBot(discord.Client):
     async def close(self) -> None:
         if self.assistant:
             await self.assistant.aclose()
+        if self.local:
+            await self.local.aclose()
         await super().close()
 
     async def on_ready(self) -> None:
@@ -1024,6 +1275,70 @@ class GrokBot(discord.Client):
             "Logged in as %s (model %s, grok for X: %s, web search: %s, default mode %s)",
             self.user, MODEL, GROK_MODEL if HAS_GROK else "off", "tavily" if TAVILY_API_KEY else "off", DEFAULT_SEARCH,
         )
+        log.info(
+            "Follow-ups without @: default %s, window %.0fs, chain %d, %d/channel/hour, local model: %s",
+            "on" if INTERJECT_DEFAULT else "off", INTERJECT_WINDOW_S, INTERJECT_MAX_CHAIN,
+            INTERJECT_PER_CHANNEL_HOUR, f"{INTERJECT_MODEL} at {OLLAMA_URL}" if OLLAMA_URL else "none (heuristics only)",
+        )
+
+    # ---- local model (Ollama on the box)
+
+    def local_http(self) -> httpx.AsyncClient:
+        if self.local is None:
+            self.local = httpx.AsyncClient(timeout=httpx.Timeout(INTERJECT_TIMEOUT_S + 1))
+        return self.local
+
+    async def pull_model(self) -> None:
+        """Make sure Ollama has INTERJECT_MODEL (a pull is a no-op when it does), then load it.
+        Retries with backoff while Ollama isn't up yet. Until it succeeds, classify() fails and
+        the strict heuristic decides."""
+        delay = 5.0
+        while not self.is_closed():
+            try:
+                r = await self.local_http().post(
+                    f"{OLLAMA_URL}/api/pull", json={"model": INTERJECT_MODEL, "stream": False},
+                    timeout=httpx.Timeout(10.0, read=3600.0),
+                )
+                if r.status_code < 400 and r.json().get("status") == "success":
+                    log.info("local model %s ready", INTERJECT_MODEL)
+                    try:  # load it now, so the first real check isn't slow
+                        await self.local_http().post(
+                            f"{OLLAMA_URL}/api/generate", json={"model": INTERJECT_MODEL, "keep_alive": -1},
+                            timeout=httpx.Timeout(10.0, read=300.0),
+                        )
+                    except Exception as e:
+                        log.warning("loading %s failed: %s", INTERJECT_MODEL, e)
+                    return
+                log.warning("ollama pull %s: HTTP %s %s", INTERJECT_MODEL, r.status_code, r.text[:200])
+            except Exception as e:
+                log.info("ollama not reachable yet (%s); retrying in %.0fs", type(e).__name__, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300.0)
+
+    async def classify(self, transcript: str) -> bool | None:
+        """Ask the local model whether the last message is addressed to the bot. None on any
+        error or timeout."""
+        body = {
+            "model": INTERJECT_MODEL,
+            "messages": [
+                {"role": "system", "content": INTERJECT_SYSTEM},
+                {"role": "user", "content": transcript},
+            ],
+            "stream": False,
+            "format": INTERJECT_FORMAT,
+            "options": {"temperature": 0, "num_predict": 20},
+            "keep_alive": -1,
+        }
+        try:
+            r = await asyncio.wait_for(self.local_http().post(f"{OLLAMA_URL}/api/chat", json=body), INTERJECT_TIMEOUT_S)
+            if r.status_code >= 400:
+                log.warning("local model: HTTP %s %s", r.status_code, r.text[:200])
+                return None
+            verdict = json.loads(r.json()["message"]["content"]).get("addressed")
+            return verdict if isinstance(verdict, bool) else None
+        except Exception as e:
+            log.warning("local model check failed: %s", type(e).__name__)
+            return None
 
     async def answer(self, user_id: int, prompt: str | list[dict], mode: str, thread: str | None) -> Reply:
         reply = await self.assistant.ask(prompt, mode, thread, user_id)
@@ -1080,34 +1395,50 @@ class GrokBot(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or not self.user:
             return
+        if message.guild and self.shushed(message):
+            return
         ref = message.reference
         thread = self.store.thread_for(ref.message_id) if ref and ref.message_id else None
         mentioned = self.user in message.mentions
         is_dm = isinstance(message.channel, discord.DMChannel)
         if not (mentioned or thread or is_dm):
+            if message.guild:
+                await self.maybe_interject(message)  # local only; returns quietly unless it answers
             return
 
         me = message.guild.me if message.guild else self.user
         question = message.clean_content.replace(f"@{me.display_name}", "").replace(f"@{self.user.name}", "").strip()
         if not (question or message.reference or message.attachments):
             return
+        if message.guild:
+            self.store.label_missed(message.channel.id, message.author.id, time.time() - 90)
         if err := self.store.check(message.author.id):
             await message.reply(err, mention_author=False)
             return
+        await self.respond(message, question, thread)
 
+    async def respond(
+        self, message: discord.Message, question: str, thread: str | None, *,
+        anchor: discord.Message | None = None, interjected: bool = False, chain: int = 0,
+    ) -> list[discord.Message]:
+        """Answer message through the normal path. Returns the sent messages ([] on failure)."""
         # A reply to one of our answers continues that stored model thread (previous_response_id).
         # The channel history now also holds our answers, but only as text: the thread still adds
         # the full earlier turn (the reply chain, images and search results it was answered with),
         # so "source?" or "what did the second link say?" work. Kept; to avoid sending the same
         # exchange twice, build_prompt then only adds history from after the replied-to answer.
+        # An interjection continues the thread of the answer it follows up on (anchor).
         async with message.channel.typing():
             try:
-                built = await build_prompt(message, self.user, question, bool(thread), self.store)
+                built = await build_prompt(
+                    message, self.user, question, bool(thread), self.store, anchor=anchor, interjected=interjected
+                )
                 reply = await self.answer(message.author.id, built.prompt, DEFAULT_SEARCH, thread)
             except Exception:
                 log.exception("ask failed")
-                await message.reply("Request failed, try again in a bit.", mention_author=False)
-                return
+                if not interjected:  # nobody asked for an interjection; fail quietly
+                    await message.reply("Request failed, try again in a bit.", mention_author=False)
+                return []
 
         sent, target = [], message
         for chunk in split_message(with_footer(reply)):
@@ -1120,6 +1451,189 @@ class GrokBot(discord.Client):
             question=question, parent=built.parent, attachments=bool(message.attachments),
             asked_at=message.created_at.timestamp(), answered_at=sent[0].created_at.timestamp(), answer=reply.text,
         )
+        if message.guild:
+            self.open_convo(message.channel.id, message.author.id, sent[0], chain)
+        return sent
+
+    # ---- interjection
+
+    def open_convo(self, channel_id: int, user_id: int, answer: discord.Message, chain: int = 0) -> None:
+        """user_id just got an answer in channel_id: they may follow up without an @ for a while."""
+        self.convos[channel_id] = Convo(user_id, answer, time.time(), chain)
+
+    def bot_names(self, guild) -> set[str]:
+        names = {"grok"}
+        for u in (self.user, getattr(guild, "me", None)):
+            for attr in ("name", "display_name", "global_name", "nick"):
+                n = getattr(u, attr, None) if u else None
+                if isinstance(n, str) and len(n.strip()) >= 3:
+                    names.add(n.strip().lower())
+        return names
+
+    def mute(self, channel_id: int, why: str) -> None:
+        self.muted_until[channel_id] = time.time() + INTERJECT_MUTE_S
+        self.convos.pop(channel_id, None)
+        log.info("interject muted in %s for %d min (%s)", channel_id, INTERJECT_MUTE_S // 60, why)
+
+    def shushed(self, message: discord.Message) -> bool:
+        """'shut up grok' / 'not you grok' soon after an interjection: mute and close. True if it was."""
+        cid = message.channel.id
+        if time.time() - self.last_interjection.get(cid, 0) > INTERJECT_SHUSH_WINDOW_S:
+            return False
+        text = message.clean_content or ""
+        if not _SHUT_UP.search(text):
+            return False
+        ref = message.reference
+        to_bot = (self.user in message.mentions) or (ref is not None and ref.message_id in self.interjected)
+        named = re.search(rf"(?<!\w)@?(?:{name_pattern(self.bot_names(message.guild))})(?!\w)", text, re.I)
+        if not (to_bot or named or len(text.split()) <= 4):
+            return False
+        for _mid, (ch, row) in list(self.interjected.items())[-5:]:
+            if ch == cid:
+                self.store.label_interject(row, "false_positive")
+        self.mute(cid, "told to")
+        return True
+
+    def _skip_reason(self, message: discord.Message, convo: Convo, now: float, names: set[str]) -> str | None:
+        """Hard skips for a message from the conversation's asker. Reasons in CLOSE_REASONS also
+        end the conversation."""
+        if now < self.muted_until.get(message.channel.id, 0):
+            return "muted"
+        if now - convo.answered_at > INTERJECT_WINDOW_S:
+            return "expired"
+        if convo.chain >= INTERJECT_MAX_CHAIN:
+            return "chain_cap"
+        if convo.others >= 2:
+            return "others"
+        if message.mention_everyone or message.role_mentions or any(u.id != self.user.id for u in message.mentions):
+            return "addressed_other"
+        ref = message.reference
+        if ref is not None and ref.message_id:
+            parent = ref.resolved if isinstance(ref.resolved, discord.Message) else getattr(ref, "cached_message", None)
+            if not isinstance(parent, discord.Message) or parent.author.id != self.user.id:
+                return "addressed_other"
+        text = message.clean_content or ""
+        if not re.search(r"\w", visible_text(text)):
+            return "no_text"
+        if len(text) > INTERJECT_MAX_CHARS:
+            return "too_long"
+        if is_ack(text, names):
+            return "ack"
+        if convo.busy:
+            return "busy"
+        return None
+
+    CLOSE_REASONS = ("expired", "others", "addressed_other", "ack")
+
+    def hourly_count(self, channel_id: int, now: float) -> int:
+        times = [t for t in self.interjection_times.get(channel_id, []) if now - t < 3600]
+        self.interjection_times[channel_id] = times
+        return len(times)
+
+    def transcript_for(self, message: discord.Message) -> str:
+        cid = message.channel.id
+        earlier = [
+            m for m in self.cached_messages
+            if getattr(m.channel, "id", None) == cid and m.id != message.id and m.created_at <= message.created_at
+        ]
+        return interject_transcript([*earlier[-(INTERJECT_CONTEXT - 1):], message], self.user.id)
+
+    async def maybe_interject(self, message: discord.Message) -> None:
+        """A guild message that didn't @mention or reply to the bot. Decide locally whether it is a
+        follow-up meant for the bot, and answer it if so."""
+        cid = message.channel.id
+        convo = self.convos.get(cid)
+        if convo is None or not self.store.interject_enabled(cid):
+            return
+        if message.author.id != convo.user_id:
+            convo.others += 1
+            convo.last_other = True
+            ref = message.reference
+            parent = getattr(ref, "resolved", None) if ref else None
+            talks_to_asker = any(u.id == convo.user_id for u in message.mentions) or (
+                isinstance(parent, discord.Message) and parent.author.id == convo.user_id
+            )
+            if talks_to_asker or convo.others >= 2:
+                self.convos.pop(cid, None)  # people moved on
+            return
+
+        now = time.time()
+        names = self.bot_names(message.guild)
+        log_base = {"channel_id": cid, "message_id": message.id, "author_id": message.author.id}
+        if reason := self._skip_reason(message, convo, now, names):
+            self.store.log_interject(**log_base, score=None, features="", reason=reason)
+            if reason in self.CLOSE_REASONS:
+                self.convos.pop(cid, None)
+            convo.last_other = False
+            return
+
+        ref = message.reference
+        score, feats = interject_score(
+            message.clean_content, names, now - convo.answered_at, convo.others, convo.last_other, convo.chain,
+            reply_to_bot=bool(ref and ref.message_id),
+        )
+        convo.last_other = False
+        features = ",".join(feats)
+        if score < INTERJECT_CANDIDATE:
+            self.store.log_interject(**log_base, score=score, features=features, reason="low_score")
+            return
+        if INTERJECT_PER_CHANNEL_HOUR and self.hourly_count(cid, now) >= INTERJECT_PER_CHANNEL_HOUR:
+            self.store.log_interject(**log_base, score=score, features=features, reason="hourly_cap")
+            log.info("interject ch=%s msg=%s score=%d -> skip (hourly cap)", cid, message.id, score)
+            return
+
+        convo.busy = True
+        try:
+            llm, llm_ms = "off", None
+            if OLLAMA_URL:
+                t0 = time.monotonic()
+                verdict = await self.classify(self.transcript_for(message))
+                llm_ms = int((time.monotonic() - t0) * 1000)
+                llm = {True: "yes", False: "no", None: "error"}[verdict]
+                yes = verdict if verdict is not None else score >= INTERJECT_STRICT
+            else:
+                yes = score >= INTERJECT_STRICT
+            row = self.store.log_interject(
+                **log_base, score=score, features=features, reason="scored", llm=llm, llm_ms=llm_ms,
+                decision="answer" if yes else "skip",
+            )
+            log.info(
+                "interject ch=%s msg=%s score=%d [%s] llm=%s%s -> %s", cid, message.id, score, features, llm,
+                f" ({llm_ms}ms)" if llm_ms is not None else "", "answer" if yes else "skip",
+            )
+            if not yes:
+                return
+            if self.convos.get(cid) is not convo or time.time() < self.muted_until.get(cid, 0):
+                self.store.set_decision(row, "muted")  # closed or muted while the model was thinking
+                return
+            if err := self.store.check(message.author.id):
+                self.store.set_decision(row, "capped")  # stay silent: nobody asked
+                log.info("interject ch=%s msg=%s not sent: %s", cid, message.id, err)
+                return
+            self.interjection_times.setdefault(cid, []).append(now)
+            self.last_interjection[cid] = time.time()
+            thread = self.store.thread_for(convo.answer.id)
+            sent = await self.respond(
+                message, message.clean_content.strip(), thread,
+                anchor=convo.answer, interjected=True, chain=convo.chain + 1,
+            )
+            for m in sent:
+                self.interjected[m.id] = (cid, row)
+            while len(self.interjected) > 200:
+                self.interjected.pop(next(iter(self.interjected)))
+        finally:
+            convo.busy = False
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        """A mute reaction on an interjected answer: close the conversation and mute the channel."""
+        if not self.user or payload.user_id == self.user.id:
+            return
+        hit = self.interjected.get(payload.message_id)
+        if hit is None or str(payload.emoji) not in MUTE_EMOJI:
+            return
+        channel_id, row = hit
+        self.store.label_interject(row, "false_positive")
+        self.mute(channel_id, f"reaction {payload.emoji}")
 
 
 bot = GrokBot()
@@ -1163,6 +1677,39 @@ async def ask_cmd(
             question=question, parent=None, attachments=False,
             asked_at=interaction.created_at.timestamp(), answered_at=sent[0].created_at.timestamp(), answer=reply.text,
         )
+        if interaction.guild is not None:
+            bot.open_convo(interaction.channel_id, interaction.user.id, sent[0])
+
+
+@bot.tree.command(name="grokinterject", description="Let the bot answer follow-ups without an @ in this channel")
+@app_commands.describe(setting="on, off, or status (default)")
+@app_commands.default_permissions(manage_channels=True)
+@app_commands.guild_only()
+async def interject_cmd(interaction: discord.Interaction, setting: Literal["on", "off", "status"] = "status") -> None:
+    cid = interaction.channel_id
+    if setting in ("on", "off"):
+        perms = interaction.permissions
+        if not (perms and perms.manage_channels):
+            await interaction.response.send_message("You need Manage Channels to change this.", ephemeral=True)
+            return
+        bot.store.set_interject(cid, setting == "on")
+        if setting == "off":
+            bot.convos.pop(cid, None)
+        else:
+            bot.muted_until.pop(cid, None)
+        log.info("interject %s in %s by %s", setting, cid, interaction.user.id)
+    on = bot.store.interject_enabled(cid)
+    muted = bot.muted_until.get(cid, 0) - time.time()
+    lines = [
+        f"Follow-ups without @ in this channel: **{'on' if on else 'off'}**"
+        + (f" (muted for {math.ceil(muted / 60)} more min)" if on and muted > 0 else "") + ".",
+        f"The last person the bot answered can follow up for {INTERJECT_WINDOW_S:.0f}s without an @, "
+        f"up to {INTERJECT_MAX_CHAIN} times in a row. React with {' or '.join(MUTE_EMOJI)} to an unprompted "
+        f"answer, or say \"not you grok\", to mute it here for {INTERJECT_MUTE_S // 60} min.",
+        "Decided locally (" + (f"heuristics + {INTERJECT_MODEL}" if OLLAMA_URL else "heuristics only")
+        + "); messages it doesn't answer are never sent to OpenAI or xAI.",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="grokusage", description="Show today's spend")

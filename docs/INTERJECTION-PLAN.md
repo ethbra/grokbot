@@ -1,8 +1,59 @@
 # Plan: answering follow-ups without an @mention ("interjecting")
 
-Status: **plan only, not built.** Hard requirement: the decision to answer is made on
-Svalbard. A message the bot wasn't addressed with never goes to OpenAI, xAI or Tavily
-unless the local check says yes.
+Status: **built** (after v0.4.0). The user-facing description is in the README under "Follow-ups
+without @". Hard requirement: the decision to answer is made on Svalbard. A message the bot
+wasn't addressed with never goes to OpenAI, xAI or Tavily unless the local check says yes.
+
+## What was built, and how it differs from the plan below
+
+The owner's decisions changed the rollout:
+
+- **No shadow phase.** It went live with the heuristics and weights below, the window
+  (120 s) and the chain limit (2).
+- **On by default in every channel** (`INTERJECT_DEFAULT=on`).
+  - `/grokinterject on | off | status` (Manage Channels for on/off) replaces the planned
+    `off | shadow | live | status`.
+  - The setting lives in `channel_settings`.
+- **The local model ships now.** Ollama runs with `network_mode: "service:grokbot"`, so it
+  is at `http://127.0.0.1:11434` (`OLLAMA_URL`; empty = no model stage).
+  - At startup the bot pulls `INTERJECT_MODEL` (`qwen2.5:1.5b-instruct-q4_K_M`) in the
+    background and retries with backoff while Ollama isn't up, then loads it with
+    `keep_alive: -1`.
+  - The check uses `/api/chat` with temperature 0 and a JSON-schema `format` forcing
+    `{"addressed": bool}`.
+- **Timeout and fallback.** The timeout is 5 s (`INTERJECT_TIMEOUT_S`), not 2 s, because the
+  model may run on the CPU if driver 535 doesn't work with this Ollama. On a model error or
+  timeout the bot **falls back to the strict heuristic** (score of 8 or more) instead of
+  staying silent.
+  - Model configured: answers when the score is 5 or more and the model says yes.
+  - No model configured: answers when the score is 8 or more.
+- **"Other people talking" in detail:**
+  - One message from someone else gives -3, and -2 more if it was the last message before
+    the follow-up.
+  - Two such messages, or anyone @mentioning or replying to the asker, close the
+    conversation.
+- **Limits.** `INTERJECT_PER_CHANNEL_HOUR=6`. There is no separate interjection dollar
+  budget: the normal caps apply. Over a cap, the bot stays silent instead of posting a
+  refusal.
+- **Shut-up hatch.**
+  - Triggers: a 🤫 or 🔇 reaction on an unprompted answer, or "not you / shut up / stfu ...
+    grok" within 10 min of one.
+  - Effect: closes the conversation and mutes the channel for 30 min.
+  - A "shut up" text only counts after a recent interjection. Otherwise "@grok shut up" is
+    ordinary banter and gets answered.
+  - Reactions use the default (non-privileged) reactions intent.
+- **Decision log.**
+  - `interject_log` gets one row per message from the current asker; other people's
+    messages aren't logged.
+  - One `log.info` line per candidate (score of 5 or more).
+  - Labels `missed` and `false_positive` are filled in automatically.
+  - Rows are deleted after 30 days.
+- **Conversation state** (asker, answer, chain, other messages) is in memory only. A restart
+  just closes open conversations.
+- **Not built:** an embeddings stage, and answering a non-asker who says "grok, ..." without
+  an @ (open question 4 below).
+
+The rest of this file is the original plan, kept for reference.
 
 ## Server facts (checked 2026-11-09)
 
