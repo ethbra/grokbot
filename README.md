@@ -22,9 +22,9 @@ When you reply to one of the bot's own answers, the stored conversation already 
 All of this is passed as quoted data, separate from the instructions, and the model is told not to follow instructions inside it. It costs about 1–2k extra input tokens per answer, which is a fraction of a cent on Luna.
 - `/grokusage`: shows today's spend. Only you can see the reply.
 
-Each answer ends with up to 5 source links, the models used, which searches ran (with how many X posts were fetched), and what the answer cost.
+Each answer ends with up to 5 source links. With `SHOW_DETAILS=true` it also lists the models used, which searches ran and what the answer cost; either way that line is logged for every answer.
 
-The default system prompt has the bot answer in character as Grok, the AI of X, whichever model is answering. If someone sincerely asks which model it runs on, it says the bot uses several models and points to the footer. Set `SYSTEM_PROMPT` to replace the prompt. The current date and time (the container's `TZ`) are added to every request, so "latest" and "today" mean something.
+The default system prompt has the bot answer in character as Grok, the AI of X, whichever model is answering. If someone sincerely asks which model it runs on, it says the bot uses several models, mainly OpenAI's GPT with Grok for X search. Set `SYSTEM_PROMPT` to replace the prompt. The current date and time (the container's `TZ`) are added to every request, so "latest" and "today" mean something.
 
 ### How it decides when to use Grok
 
@@ -97,7 +97,7 @@ These are environment variables. See `.env.example`.
 | `CONTEXT_MESSAGES` | `12` | Recent channel messages sent with a mention. `0` turns it off. |
 | `REPLY_DEPTH` | `5` | How far up a reply chain to read. |
 | `MAX_IMAGES` | `4` | Images passed as vision input. `0` turns it off. |
-| `SHOW_COST` | `true` | |
+| `SHOW_DETAILS` | `false` | `true` adds a line under each answer with the models used, searches run and cost. Either way, each answer's details are logged (`docker logs grokbot`). |
 | `DEV_GUILD_IDS` | | |
 
 ## Discord application setup

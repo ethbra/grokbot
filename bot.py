@@ -59,8 +59,8 @@ SYSTEM_PROMPT = os.getenv(
     "It costs more, so don't use it for ordinary facts.\n\n"
     "Report X results as they are, with post dates; if they're thin or old, say so plainly. "
     "Cite the sources you used.\n\n"
-    "If someone sincerely asks what model you run on, be honest: this bot uses several models, and "
-    "the footer of each answer lists the ones used.",
+    "If someone sincerely asks what model you run on, be honest: this bot uses several models, "
+    "mainly OpenAI's GPT, with xAI's Grok for X search.",
 )
 DEFAULT_SEARCH = os.getenv("DEFAULT_SEARCH", "auto")
 # Spending guards (USD). 0 disables a limit.
@@ -78,7 +78,9 @@ CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "12"))
 REPLY_DEPTH = int(os.getenv("REPLY_DEPTH", "5"))
 MAX_IMAGES = int(os.getenv("MAX_IMAGES", "4"))
 CONTEXT_MSG_CHARS = 700  # per quoted message
-SHOW_COST = os.getenv("SHOW_COST", "true").lower() == "true"
+# Footer line with the models used, searches run and cost. Off by default; every answer's
+# details are logged either way (docker logs grokbot), and /grokusage shows spend.
+SHOW_DETAILS = os.getenv("SHOW_DETAILS", "false").lower() == "true"
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", "/tmp/grokbot-heartbeat"))
 # Optional: comma-separated guild IDs for instant slash-command sync while testing.
@@ -480,21 +482,30 @@ def split_message(text: str, limit: int = DISCORD_LIMIT) -> list[str]:
     return chunks
 
 
-def footer(reply: Reply) -> str:
-    parts = []
-    if reply.citations:
-        parts.append("**Sources:** " + " ".join(f"<{u}>" for u in reply.citations[:5]))
+def details(reply: Reply) -> str:
+    """models · searches · cost, e.g. "gpt-6-luna + grok-4.3 · searched: 1 X (5 posts) · $0.0312"."""
     meta = [" + ".join(reply.models)] if reply.models else []
     if reply.searches:
         meta.append("searched: " + ", ".join(
             f"{n} {k}" + (f" ({reply.x_posts} posts)" if k == "X" and reply.x_posts else "")
             for k, n in reply.searches.items()
         ))
-    if SHOW_COST and reply.cost_usd:
-        meta.append(f"${reply.cost_usd:.4f}")
-    if meta:
-        parts.append("-# " + " · ".join(meta))
+    meta.append(f"${reply.cost_usd:.4f}")
+    return " · ".join(meta)
+
+
+def footer(reply: Reply) -> str:
+    parts = []
+    if reply.citations:
+        parts.append("**Sources:** " + " ".join(f"<{u}>" for u in reply.citations[:5]))
+    if SHOW_DETAILS:
+        parts.append("-# " + details(reply))
     return "\n".join(parts)
+
+
+def with_footer(reply: Reply) -> str:
+    foot = footer(reply)
+    return reply.text + ("\n\n" + foot if foot else "")
 
 
 # --------------------------------------------------------------------------- discord context
@@ -695,6 +706,7 @@ class GrokBot(discord.Client):
     async def answer(self, user_id: int, prompt: str | list[dict], mode: str, thread: str | None) -> Reply:
         reply = await self.assistant.ask(prompt, mode, thread, user_id)
         self.store.record(user_id, reply.cost_usd)
+        log.info("answered %s (%s): %s", user_id, mode, details(reply))
         return reply
 
     async def on_message(self, message: discord.Message) -> None:
@@ -725,7 +737,7 @@ class GrokBot(discord.Client):
                 return
 
         sent_ids, target = [], message
-        for chunk in split_message(reply.text + "\n\n" + footer(reply)):
+        for chunk in split_message(with_footer(reply)):
             target = await target.reply(chunk, mention_author=False, suppress_embeds=True)
             sent_ids.append(target.id)
         self.store.remember(sent_ids, reply.thread)
@@ -761,7 +773,7 @@ async def ask_cmd(
 
     header = f"> **{interaction.user.display_name}:** {question[:300]}\n\n"
     sent_ids = []
-    for chunk in split_message(header + reply.text + "\n\n" + footer(reply)):
+    for chunk in split_message(header + with_footer(reply)):
         msg = await interaction.followup.send(chunk, suppress_embeds=True, wait=True)
         sent_ids.append(msg.id)
     bot.store.remember(sent_ids, reply.thread)
