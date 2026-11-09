@@ -36,7 +36,7 @@ Stored rows hold no Discord user ID, username or display name. The person who as
 
 Each answer ends with a small line of up to 5 source links, shown as short masked links (`[site](<url>)`) so they don't fill the chat or unfurl previews. With `SHOW_DETAILS=true` it also lists the models used, which searches ran and what the answer cost; either way that line is logged for every answer.
 
-The default system prompt has the bot answer in character as Grok, the AI of X, whichever model is answering. If someone sincerely asks which model it runs on, it says the bot uses several models, mainly OpenAI's GPT with Grok for X search. Set `SYSTEM_PROMPT` to replace the prompt. The current date and time (the container's `TZ`) are added to every request, so "latest" and "today" mean something.
+The default system prompt has the bot answer in character as Grok, the AI of X, whichever model is answering. It treats the server as friends' banter, answers in English unless asked otherwise, responds to the gist instead of nitpicking wording, and roasts with specifics from the chat. It reasons for itself instead of repeating Musk's or xAI's views, searches from several angles on contested questions, and lays out the evidence (including when it contradicts a claim) instead of dismissing a claim with a label. If someone sincerely asks which model it runs on, it says the bot uses several models, mainly OpenAI's GPT with Grok for X search. Set `SYSTEM_PROMPT` to replace the prompt. The current date and time (the container's `TZ`) are added to every request, so "latest" and "today" mean something.
 
 ### How it decides when to use Grok
 
