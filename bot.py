@@ -31,6 +31,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import discord
 import httpx
@@ -71,7 +72,8 @@ short line with no sermon.
 Style: no emojis or emoticons, ever. No "Great question", no hype, no exclamation-mark enthusiasm, no \
 "let me know if you need anything" sign-offs. Match the length to the message: a one-liner gets a \
 one-liner; a real question gets a real answer. Plain sentences for chat; lists or headers only when \
-the content actually needs structure. Discord markdown.
+the content actually needs structure. Discord markdown. Never paste bare URLs: link inline as \
+[short text](<url>), and keep it to the few links that matter (a sources line is added for you).
 """
 
 SYSTEM_PROMPT = os.getenv(
@@ -482,8 +484,11 @@ class Assistant:
             if round_no == MAX_TOOL_ROUNDS - 1:
                 body["tool_choice"] = "none"  # last round: answer with what you have
 
-        # Prefer the URLs the model cited; fall back to what the web search returned.
-        reply.citations = list(dict.fromkeys(reply.citations or reply.searched_urls))
+        # Prefer the URLs the model cited. Fall back to the top search results only when the
+        # answer links nothing itself, so the sources line isn't a dump of every result.
+        if not reply.citations and "](" not in (reply.text or ""):
+            reply.citations = reply.searched_urls[:3]
+        reply.citations = list(dict.fromkeys(reply.citations))
         reply.text = reply.text or "_(no answer)_"
         return reply
 
@@ -518,10 +523,32 @@ def details(reply: Reply) -> str:
     return " · ".join(meta)
 
 
+def source_label(url: str) -> str:
+    """Short link text: the site's domain, or @handle / "X post" for X links."""
+    parsed = urlsplit(url)
+    host = parsed.netloc.lower().removeprefix("www.").removeprefix("m.").replace(".m.", ".")
+    path = [p for p in parsed.path.split("/") if p]
+    if host in ("x.com", "twitter.com", "mobile.twitter.com"):
+        return f"@{path[0]}" if path and path[0] not in ("i", "search", "hashtag") else "X post"
+    return host or "link"
+
+
+def sources_line(urls: list[str]) -> str:
+    """Masked links ([label](<url>)): short in chat, and the <> stops Discord previews."""
+    links, used = [], {}
+    for url in urls[:5]:
+        label = source_label(url).replace("[", "").replace("]", "")
+        used[label] = used.get(label, 0) + 1
+        if used[label] > 1:
+            label = f"{label} ({used[label]})"
+        links.append(f"[{label}](<{url}>)")
+    return "-# Sources: " + " · ".join(links)
+
+
 def footer(reply: Reply) -> str:
     parts = []
     if reply.citations:
-        parts.append("**Sources:** " + " ".join(f"<{u}>" for u in reply.citations[:5]))
+        parts.append(sources_line(reply.citations))
     if SHOW_DETAILS:
         parts.append("-# " + details(reply))
     return "\n".join(parts)
