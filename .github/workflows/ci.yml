@@ -32,7 +32,7 @@ jobs:
           OPENAI_API_KEY: dummy
           XAI_API_KEY: dummy
           DATA_DIR: /tmp/grokbot-ci
-        run: python -c "import bot; assert {c.name for c in bot.bot.tree.get_commands()} == {'ask', 'grokinterject', 'grokusage'}"
+        run: python -c "import bot; assert {c.name for c in bot.bot.tree.get_commands()} == {'ask', 'grokusage'}"
 
   image:
     needs: check

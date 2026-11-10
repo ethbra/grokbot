@@ -10,11 +10,10 @@ A Discord bot that answers with a cheap, strong main model (OpenAI `gpt-6-luna` 
 - Reply to **anyone's** message with `@grok is this true?` and the bot sees that message, verbatim, and the reply chain above it (up to `REPLY_DEPTH`, default 25, messages). A bare `@grok` reply works too.
 - After the bot answers you in a server channel, you can follow up for 2 minutes **without** an @ or a reply ("ok but what about 1944?"). See [Follow-ups without @](#follow-ups-without-).
 - `/grokusage`: shows today's spend. Only you can see the reply.
-- `/grokinterject on | off | status`: turns follow-ups without @ on or off for the current channel (needs Manage Channels; `status` is open to anyone who can see the command).
 
 ### Follow-ups without @
 
-The person the bot last answered in a channel (by @mention, reply or `/ask`) can keep talking to it for `INTERJECT_WINDOW_S` (default 120 s) without an @. Only that person, only in that channel, and at most `INTERJECT_MAX_CHAIN` (default 2) unprompted answers in a row. An @mention or reply resets the count. It is on by default in every channel (`INTERJECT_DEFAULT`); `/grokinterject off` turns it off for a channel.
+The person the bot last answered in a channel (by @mention, reply or `/ask`) can keep talking to it for `INTERJECT_WINDOW_S` (default 120 s) without an @. Only that person, only in that channel, and at most `INTERJECT_MAX_CHAIN` (default 2) unprompted answers in a row. An @mention or reply resets the count. It is always on, in every channel.
 
 **The decision is made on the box.** A message that doesn't @mention or reply to the bot is never sent to OpenAI, xAI or Tavily unless the local check says yes, and the bot shows no typing indicator before then. The check works like this:
 
@@ -166,7 +165,6 @@ These are environment variables. See `.env.example`.
 | `REPLY_DEPTH` | `25` | How far up a reply chain to read. `0` turns it off. |
 | `MAX_IMAGES` | `4` | Images passed as vision input. `0` turns it off. |
 | `SHOW_DETAILS` | `false` | `true` adds a line under each answer with the models used, searches run and cost. Either way, each answer's details are logged (`docker logs grokbot`). |
-| `INTERJECT_DEFAULT` | `on` | Follow-ups without @ in channels that haven't been set with `/grokinterject`. |
 | `INTERJECT_WINDOW_S` | `120` | How long after an answer the asker can follow up without @. |
 | `INTERJECT_MAX_CHAIN` | `2` | Unprompted answers in a row before an @ is needed again. |
 | `INTERJECT_PER_CHANNEL_HOUR` | `6` | Unprompted answers per channel per hour. `0` means no limit. |

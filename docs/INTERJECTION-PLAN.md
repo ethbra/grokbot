@@ -10,10 +10,9 @@ The owner's decisions changed the rollout:
 
 - **No shadow phase.** It went live with the heuristics and weights below, the window
   (120 s) and the chain limit (2).
-- **On by default in every channel** (`INTERJECT_DEFAULT=on`).
-  - `/grokinterject on | off | status` (Manage Channels for on/off) replaces the planned
-    `off | shadow | live | status`.
-  - The setting lives in `channel_settings`.
+- **Always on in every channel.** There is no per-channel setting: the planned
+  `/grokinterject off | shadow | live | status` command was dropped (a first version shipped
+  with `/grokinterject on | off | status` and `INTERJECT_DEFAULT`, both since removed).
 - **The local model ships now.** Ollama runs with `network_mode: "service:grokbot"`, so it
   is at `http://127.0.0.1:11434` (`OLLAMA_URL`; empty = no model stage).
   - At startup the bot pulls `INTERJECT_MODEL` (`qwen2.5:1.5b-instruct-q4_K_M`) in the

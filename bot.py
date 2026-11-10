@@ -34,7 +34,6 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Literal
 from urllib.parse import urlsplit
 
 import discord
@@ -154,7 +153,6 @@ HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", "/tmp/grokbot-heartbeat"))
 DEV_GUILD_IDS = [int(g) for g in os.getenv("DEV_GUILD_IDS", "").split(",") if g.strip()]
 # Follow-ups without an @ ("interjecting"). Decided locally: heuristics, then optionally a small
 # model on a local Ollama. A message that doesn't pass never leaves the box.
-INTERJECT_DEFAULT = os.getenv("INTERJECT_DEFAULT", "on").lower() in ("on", "true", "1", "yes")
 INTERJECT_WINDOW_S = float(os.getenv("INTERJECT_WINDOW_S", "120"))
 INTERJECT_MAX_CHAIN = int(os.getenv("INTERJECT_MAX_CHAIN", "2"))
 INTERJECT_PER_CHANNEL_HOUR = int(os.getenv("INTERJECT_PER_CHANNEL_HOUR", "6"))
@@ -299,8 +297,7 @@ class Store:
                 text TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS history_by_channel ON history (channel_id, created);
             CREATE TABLE IF NOT EXISTS history_salt (epoch INTEGER PRIMARY KEY, salt BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS channel_settings (
-                channel_id INTEGER PRIMARY KEY, interject INTEGER NOT NULL);
+            DROP TABLE IF EXISTS channel_settings;  -- held the old per-channel on/off setting
             CREATE TABLE IF NOT EXISTS interject_log (  -- no message text, ever
                 ts REAL NOT NULL, channel_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
                 author_id INTEGER NOT NULL, score INTEGER, features TEXT NOT NULL,
@@ -421,15 +418,7 @@ class Store:
         ).fetchone()
         return row[0] if row else None
 
-    # ---- interjection settings and decision log
-
-    def interject_enabled(self, channel_id: int) -> bool:
-        row = self.db.execute("SELECT interject FROM channel_settings WHERE channel_id = ?", (channel_id,)).fetchone()
-        return INTERJECT_DEFAULT if row is None else bool(row[0])
-
-    def set_interject(self, channel_id: int, on: bool) -> None:
-        self.db.execute("INSERT OR REPLACE INTO channel_settings VALUES (?, ?)", (channel_id, int(on)))
-        self.db.commit()
+    # ---- interjection decision log
 
     def log_interject(
         self, *, channel_id: int, message_id: int, author_id: int, score: int | None, features: str,
@@ -1276,8 +1265,8 @@ class GrokBot(discord.Client):
             self.user, MODEL, GROK_MODEL if HAS_GROK else "off", "tavily" if TAVILY_API_KEY else "off", DEFAULT_SEARCH,
         )
         log.info(
-            "Follow-ups without @: default %s, window %.0fs, chain %d, %d/channel/hour, local model: %s",
-            "on" if INTERJECT_DEFAULT else "off", INTERJECT_WINDOW_S, INTERJECT_MAX_CHAIN,
+            "Follow-ups without @: window %.0fs, chain %d, %d/channel/hour, local model: %s",
+            INTERJECT_WINDOW_S, INTERJECT_MAX_CHAIN,
             INTERJECT_PER_CHANNEL_HOUR, f"{INTERJECT_MODEL} at {OLLAMA_URL}" if OLLAMA_URL else "none (heuristics only)",
         )
 
@@ -1543,7 +1532,7 @@ class GrokBot(discord.Client):
         follow-up meant for the bot, and answer it if so."""
         cid = message.channel.id
         convo = self.convos.get(cid)
-        if convo is None or not self.store.interject_enabled(cid):
+        if convo is None:
             return
         if message.author.id != convo.user_id:
             convo.others += 1
@@ -1679,37 +1668,6 @@ async def ask_cmd(
         )
         if interaction.guild is not None:
             bot.open_convo(interaction.channel_id, interaction.user.id, sent[0])
-
-
-@bot.tree.command(name="grokinterject", description="Let the bot answer follow-ups without an @ in this channel")
-@app_commands.describe(setting="on, off, or status (default)")
-@app_commands.default_permissions(manage_channels=True)
-@app_commands.guild_only()
-async def interject_cmd(interaction: discord.Interaction, setting: Literal["on", "off", "status"] = "status") -> None:
-    cid = interaction.channel_id
-    if setting in ("on", "off"):
-        perms = interaction.permissions
-        if not (perms and perms.manage_channels):
-            await interaction.response.send_message("You need Manage Channels to change this.", ephemeral=True)
-            return
-        bot.store.set_interject(cid, setting == "on")
-        if setting == "off":
-            bot.convos.pop(cid, None)
-        else:
-            bot.muted_until.pop(cid, None)
-        log.info("interject %s in %s by %s", setting, cid, interaction.user.id)
-    on = bot.store.interject_enabled(cid)
-    muted = bot.muted_until.get(cid, 0) - time.time()
-    lines = [
-        f"Follow-ups without @ in this channel: **{'on' if on else 'off'}**"
-        + (f" (muted for {math.ceil(muted / 60)} more min)" if on and muted > 0 else "") + ".",
-        f"The last person the bot answered can follow up for {INTERJECT_WINDOW_S:.0f}s without an @, "
-        f"up to {INTERJECT_MAX_CHAIN} times in a row. React with {' or '.join(MUTE_EMOJI)} to an unprompted "
-        f"answer, or say \"not you grok\", to mute it here for {INTERJECT_MUTE_S // 60} min.",
-        "Decided locally (" + (f"heuristics + {INTERJECT_MODEL}" if OLLAMA_URL else "heuristics only")
-        + "); messages it doesn't answer are never sent to OpenAI or xAI.",
-    ]
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="grokusage", description="Show today's spend")
