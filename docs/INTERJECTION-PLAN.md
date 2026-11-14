@@ -15,16 +15,24 @@ The owner's decisions changed the rollout:
   with `/grokinterject on | off | status` and `INTERJECT_DEFAULT`, both since removed).
 - **The local model ships now.** Ollama runs with `network_mode: "service:grokbot"`, so it
   is at `http://127.0.0.1:11434` (`OLLAMA_URL`; empty = no model stage).
-  - At startup the bot pulls `INTERJECT_MODEL` (`qwen2.5:1.5b-instruct-q4_K_M`) in the
-    background and retries with backoff while Ollama isn't up, then loads it with
-    `keep_alive: -1`.
-  - The check uses `/api/chat` with temperature 0 and a JSON-schema `format` forcing
-    `{"addressed": bool}`.
+  - At startup the bot pulls `INTERJECT_MODEL` (`qwen3:1.7b`) in the background and retries
+    with backoff while Ollama isn't up, then runs one check with `keep_alive: -1` to warm it
+    up. Loading alone isn't enough: the first inference after a load took about 37 s.
+  - The check uses `/api/chat` with temperature 0, thinking off, and a JSON-schema `format`
+    forcing `{"kind": ...}`, one of six kinds. "Question or request for Grok" and "challenge
+    to Grok" count as yes.
+  - The model sees only the bot's last answer and the asker's follow-up.
+  - **Why this changed (Nov 2026).** The first version (Qwen2.5 1.5B, a yes/no prompt over
+    the last 6 channel messages, only for scores of 5 or more) answered 13 of 76 real
+    follow-ups in a test on 117 hand-labelled messages from one channel. Most follow-ups
+    never reached the model: "how old is he" scores 3. On the same messages, Qwen3 1.7B with
+    the kind prompt caught 72 of 76 and said yes to 3 of 35 non-follow-ups, at about 80 ms a
+    check. Qwen2.5 3B and Qwen3 4B were no better, and thinking was slower and less reliable.
 - **Timeout and fallback.** The timeout is 5 s (`INTERJECT_TIMEOUT_S`), not 2 s, because the
   model may run on the CPU if driver 535 doesn't work with this Ollama. On a model error or
   timeout the bot **falls back to the strict heuristic** (score of 8 or more) instead of
   staying silent.
-  - Model configured: answers when the score is 5 or more and the model says yes.
+  - Model configured: answers when the model says yes. There is no score gate before it.
   - No model configured: answers when the score is 8 or more.
 - **"Other people talking" in detail:**
   - One message from someone else gives -3, and -2 more if it was the last message before
@@ -44,7 +52,7 @@ The owner's decisions changed the rollout:
 - **Decision log.**
   - `interject_log` gets one row per message from the current asker; other people's
     messages aren't logged.
-  - One `log.info` line per candidate (score of 5 or more).
+  - One `log.info` line per message that reached the model or passed the score.
   - Labels `missed` and `false_positive` are filled in automatically.
   - Rows are deleted after 30 days.
 - **Conversation state** (asker, answer, chain, other messages) is in memory only. A restart

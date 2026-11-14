@@ -151,18 +151,17 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 HEARTBEAT_FILE = Path(os.getenv("HEARTBEAT_FILE", "/tmp/grokbot-heartbeat"))
 # Optional: comma-separated guild IDs for instant slash-command sync while testing.
 DEV_GUILD_IDS = [int(g) for g in os.getenv("DEV_GUILD_IDS", "").split(",") if g.strip()]
-# Follow-ups without an @ ("interjecting"). Decided locally: heuristics, then optionally a small
-# model on a local Ollama. A message that doesn't pass never leaves the box.
+# Follow-ups without an @ ("interjecting"). Decided locally: free hard skips, then a small model
+# on a local Ollama (or a strict heuristic score without one). A message that doesn't pass never
+# leaves the box.
 INTERJECT_WINDOW_S = float(os.getenv("INTERJECT_WINDOW_S", "120"))
 INTERJECT_MAX_CHAIN = int(os.getenv("INTERJECT_MAX_CHAIN", "2"))
 INTERJECT_PER_CHANNEL_HOUR = int(os.getenv("INTERJECT_PER_CHANNEL_HOUR", "6"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "").rstrip("/")  # empty: heuristics only
-INTERJECT_MODEL = os.getenv("INTERJECT_MODEL", "qwen2.5:1.5b-instruct-q4_K_M")
+INTERJECT_MODEL = os.getenv("INTERJECT_MODEL", "qwen3:1.7b")
 INTERJECT_TIMEOUT_S = float(os.getenv("INTERJECT_TIMEOUT_S", "5"))
-INTERJECT_CANDIDATE = 5  # score that makes a message a candidate (asks the local model, if any)
 INTERJECT_STRICT = 8  # score that answers on heuristics alone (no model, or the model failed)
 INTERJECT_MAX_CHARS = 400
-INTERJECT_CONTEXT = 6  # cached messages shown to the local model, the judged one included
 INTERJECT_MUTE_S = 30 * 60
 INTERJECT_SHUSH_WINDOW_S = 10 * 60  # "shut up grok" counts this long after an interjection
 INTERJECT_LOG_TTL_S = 30 * 86400
@@ -1153,24 +1152,92 @@ def interject_score(
     return score, feats
 
 
+# What the local model is asked. Measured on real follow-ups: sorting the message into a kind
+# beats a yes/no, and showing only the bot's answer and the follow-up beats showing the channel.
+INTERJECT_KINDS = (
+    "question_or_request_for_grok", "challenge_to_grok", "reaction", "talking_to_others",
+    "talking_about_grok", "statement_or_other",
+)
+INTERJECT_YES = INTERJECT_KINDS[:2]
 INTERJECT_SYSTEM = (
-    "You judge one thing: is the LAST message in a Discord group chat addressed to Grok, an AI "
-    "assistant bot, and does it expect Grok to reply? Grok answered someone shortly before. A "
-    "follow-up question or comment to Grok's answer counts as addressed to Grok. It is NOT "
-    "addressed to Grok if it talks to another person, talks about Grok instead of to it, or is "
-    "just a reaction. If unsure, answer false. Reply with JSON: {\"addressed\": true} or "
-    "{\"addressed\": false}."
+    "You are a filter for Grok, an AI assistant bot in a Discord group chat with friends. Grok only "
+    "speaks when someone @mentions it, but right after Grok answers someone, that person may send a "
+    "follow-up WITHOUT mentioning Grok. Your job: decide if their newest message is meant for Grok "
+    "and expects Grok to reply.\n\n"
+    "Answer YES when the message:\n"
+    "- asks a question (with or without a question mark), e.g. a follow-up about the same topic "
+    "using \"he\", \"it\", \"they\", \"that\" to refer to what Grok said;\n"
+    "- asks Grok to do something (explain, translate, roast, list, compare);\n"
+    "- pushes back on or challenges Grok's answer and wants a response.\n"
+    "Answer NO when the message:\n"
+    "- is a reaction: laughter, praise, insults, swearing, emoji, \"wow\", \"interesting\", \"nice\";\n"
+    "- is a comment to the other people in the chat, or mentions someone else;\n"
+    "- talks ABOUT Grok in the third person (\"it read the chart wrong\");\n"
+    "- is a typo, a correction of their own message, or gibberish.\n"
+    "Group chats are noisy: when unsure, prefer NO, but a real question is YES even if casual or rude."
+    "\n\nExamples (Grok had just answered the asker):\n"
+    "- \"when did that happen\" -> YES (follow-up question)\n"
+    "- \"and what about france\" -> YES (follow-up)\n"
+    "- \"is she married\" -> YES (question without ?)\n"
+    "- \"explain it simpler\" -> YES (request)\n"
+    "- \"thats not true, source?\" -> YES (challenges Grok)\n"
+    "- \"lmaooo\" -> NO (reaction)\n"
+    "- \"bro it actually knew that\" -> NO (talks about Grok)\n"
+    "- \"@sam you seeing this\" -> NO (talks to someone else)\n"
+    "- \"damn ok\" -> NO (reaction)\n"
+    "- \"bruh\" -> NO (reaction)"
+    "\n\nClassify the message into one kind: " + ", ".join(INTERJECT_KINDS) + ". Reply with JSON: "
+    "{\"kind\": \"...\"}."
 )
 INTERJECT_FORMAT = {
     "type": "object",
-    "properties": {"addressed": {"type": "boolean"}},
-    "required": ["addressed"],
+    "properties": {"kind": {"type": "string", "enum": list(INTERJECT_KINDS)}},
+    "required": ["kind"],
 }
 
 
+def interject_request(prompt: str) -> dict:
+    """The Ollama /api/chat body for one check. Thinking is off: at this size it is slow (past
+    the timeout) and no more accurate."""
+    return {
+        "model": INTERJECT_MODEL,
+        "messages": [
+            {"role": "system", "content": INTERJECT_SYSTEM},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "think": False,
+        "format": INTERJECT_FORMAT,
+        "options": {"temperature": 0, "num_predict": 20},
+        "keep_alive": -1,
+    }
+
+
+def interject_verdict(content: str) -> bool | None:
+    """The model's reply as yes / no, or None when it isn't a kind we asked for."""
+    try:
+        kind = json.loads(content).get("kind")
+    except (ValueError, AttributeError):
+        return None
+    return kind in INTERJECT_YES if kind in INTERJECT_KINDS else None
+
+
+def interject_prompt(answer, message, me_id: int, since_answer_s: float) -> str:
+    """What the local model sees: the bot's answer and the asker's follow-up, nothing else from
+    the channel. Names are relabelled and each message is cut to 300 chars."""
+    lines = interject_transcript([answer, message], me_id).split("\n")
+    head, _, text = lines[-1].partition(": ")
+    found = re.search(r"User \w", head)
+    asker = found.group(0) if found else "User A"
+    return (
+        f"Grok's last answer, to {asker}:\n\"{lines[0].partition(': ')[2]}\"\n\n"
+        f"{since_answer_s:.0f} seconds later, {asker} wrote:\n\"{text}\""
+    )
+
+
 def interject_transcript(msgs: list, me_id: int) -> str:
-    """The last messages for the local model, speakers relabelled Grok / User A / User B, each
-    cut to 300 chars. The last one is the message being judged."""
+    """Messages as lines, speakers relabelled Grok / User A / User B, each cut to 300 chars. The
+    last one is the message being judged."""
     labels: dict[int, str] = {}
     names: dict[str, str] = {}
 
@@ -1278,8 +1345,8 @@ class GrokBot(discord.Client):
         return self.local
 
     async def pull_model(self) -> None:
-        """Make sure Ollama has INTERJECT_MODEL (a pull is a no-op when it does), then load it.
-        Retries with backoff while Ollama isn't up yet. Until it succeeds, classify() fails and
+        """Make sure Ollama has INTERJECT_MODEL (a pull is a no-op when it does), then warm it
+        up. Retries with backoff while Ollama isn't up yet. Until it succeeds, classify() fails and
         the strict heuristic decides."""
         delay = 5.0
         while not self.is_closed():
@@ -1289,14 +1356,18 @@ class GrokBot(discord.Client):
                     timeout=httpx.Timeout(10.0, read=3600.0),
                 )
                 if r.status_code < 400 and r.json().get("status") == "success":
-                    log.info("local model %s ready", INTERJECT_MODEL)
-                    try:  # load it now, so the first real check isn't slow
-                        await self.local_http().post(
-                            f"{OLLAMA_URL}/api/generate", json={"model": INTERJECT_MODEL, "keep_alive": -1},
-                            timeout=httpx.Timeout(10.0, read=300.0),
+                    try:  # Run one real check now. Loading the weights isn't enough: the first
+                        # inference after a load takes far longer than INTERJECT_TIMEOUT_S.
+                        t0 = time.monotonic()
+                        warm = await self.local_http().post(
+                            f"{OLLAMA_URL}/api/chat",
+                            json=interject_request('Grok\'s last answer, to User A:\n"Hi."\n\n5 seconds later, User A wrote:\n"hi"'),
+                            timeout=httpx.Timeout(10.0, read=600.0),
                         )
+                        warm.raise_for_status()
+                        log.info("local model %s ready (warm-up took %.0fs)", INTERJECT_MODEL, time.monotonic() - t0)
                     except Exception as e:
-                        log.warning("loading %s failed: %s", INTERJECT_MODEL, e)
+                        log.warning("warming up %s failed: %s", INTERJECT_MODEL, e)
                     return
                 log.warning("ollama pull %s: HTTP %s %s", INTERJECT_MODEL, r.status_code, r.text[:200])
             except Exception as e:
@@ -1304,27 +1375,17 @@ class GrokBot(discord.Client):
             await asyncio.sleep(delay)
             delay = min(delay * 2, 300.0)
 
-    async def classify(self, transcript: str) -> bool | None:
-        """Ask the local model whether the last message is addressed to the bot. None on any
-        error or timeout."""
-        body = {
-            "model": INTERJECT_MODEL,
-            "messages": [
-                {"role": "system", "content": INTERJECT_SYSTEM},
-                {"role": "user", "content": transcript},
-            ],
-            "stream": False,
-            "format": INTERJECT_FORMAT,
-            "options": {"temperature": 0, "num_predict": 20},
-            "keep_alive": -1,
-        }
+    async def classify(self, prompt: str) -> bool | None:
+        """Ask the local model whether the follow-up is meant for the bot. None on any error or
+        timeout."""
         try:
-            r = await asyncio.wait_for(self.local_http().post(f"{OLLAMA_URL}/api/chat", json=body), INTERJECT_TIMEOUT_S)
+            r = await asyncio.wait_for(
+                self.local_http().post(f"{OLLAMA_URL}/api/chat", json=interject_request(prompt)), INTERJECT_TIMEOUT_S
+            )
             if r.status_code >= 400:
                 log.warning("local model: HTTP %s %s", r.status_code, r.text[:200])
                 return None
-            verdict = json.loads(r.json()["message"]["content"]).get("addressed")
-            return verdict if isinstance(verdict, bool) else None
+            return interject_verdict(r.json()["message"]["content"])
         except Exception as e:
             log.warning("local model check failed: %s", type(e).__name__)
             return None
@@ -1519,14 +1580,6 @@ class GrokBot(discord.Client):
         self.interjection_times[channel_id] = times
         return len(times)
 
-    def transcript_for(self, message: discord.Message) -> str:
-        cid = message.channel.id
-        earlier = [
-            m for m in self.cached_messages
-            if getattr(m.channel, "id", None) == cid and m.id != message.id and m.created_at <= message.created_at
-        ]
-        return interject_transcript([*earlier[-(INTERJECT_CONTEXT - 1):], message], self.user.id)
-
     async def maybe_interject(self, message: discord.Message) -> None:
         """A guild message that didn't @mention or reply to the bot. Decide locally whether it is a
         follow-up meant for the bot, and answer it if so."""
@@ -1563,7 +1616,7 @@ class GrokBot(discord.Client):
         )
         convo.last_other = False
         features = ",".join(feats)
-        if score < INTERJECT_CANDIDATE:
+        if not OLLAMA_URL and score < INTERJECT_STRICT:  # with a model, the model decides
             self.store.log_interject(**log_base, score=score, features=features, reason="low_score")
             return
         if INTERJECT_PER_CHANNEL_HOUR and self.hourly_count(cid, now) >= INTERJECT_PER_CHANNEL_HOUR:
@@ -1576,12 +1629,14 @@ class GrokBot(discord.Client):
             llm, llm_ms = "off", None
             if OLLAMA_URL:
                 t0 = time.monotonic()
-                verdict = await self.classify(self.transcript_for(message))
+                verdict = await self.classify(
+                    interject_prompt(convo.answer, message, self.user.id, now - convo.answered_at)
+                )
                 llm_ms = int((time.monotonic() - t0) * 1000)
                 llm = {True: "yes", False: "no", None: "error"}[verdict]
                 yes = verdict if verdict is not None else score >= INTERJECT_STRICT
             else:
-                yes = score >= INTERJECT_STRICT
+                yes = True  # the score already passed INTERJECT_STRICT
             row = self.store.log_interject(
                 **log_base, score=score, features=features, reason="scored", llm=llm, llm_ms=llm_ms,
                 decision="answer" if yes else "skip",

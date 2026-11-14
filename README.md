@@ -24,7 +24,8 @@ The person the bot last answered in a channel (by @mention, reply or `/ask`) can
    - two or more other people have spoken since the answer, or someone talked to the asker (this closes the conversation);
    - it is only a link, emoji or attachment, longer than 400 characters, or a bare "thanks" / "ok" / "lol";
    - the channel is muted.
-2. **Score.** The bot adds up these signals:
+2. **Local model.** When `OLLAMA_URL` is set, every message that passes the hard skips goes to a small model on a local Ollama (`INTERJECT_MODEL`, default Qwen3 1.7B, thinking off). The model sees only two things: the bot's last answer and the asker's follow-up. It sees nothing else from the channel. Speakers are relabelled Grok / User A and each message is cut to 300 characters. The model sorts the follow-up into a kind (question or request for Grok, challenge to Grok, reaction, talking to others, talking about Grok, other); the first two count as yes.
+3. **Score.** The fallback when there is no model or the model fails. The bot adds up these signals:
 
    | Signal | Points |
    |---|---|
@@ -39,12 +40,11 @@ The person the bot last answered in a channel (by @mention, reply or `/ask`) can
    | Someone else spoke last | -2 |
    | Per earlier unprompted answer in the chain | -1 |
 
-3. **Local model.** This step runs only when `OLLAMA_URL` is set, and only for scores of 5 or more. The bot sends the last 6 messages in the channel to a small model on a local Ollama (`INTERJECT_MODEL`, default Qwen2.5 1.5B). Speakers are relabelled Grok / User A / User B and each message is cut to 300 characters. The model answers yes or no.
 4. **Decision.**
 
    | Setup | Answers when |
    |---|---|
-   | Local model configured | The score is 5 or more and the model says yes |
+   | Local model configured | The model says yes |
    | Model configured, but it fails or takes longer than `INTERJECT_TIMEOUT_S` | The score is 8 or more |
    | No model configured | The score is 8 or more |
 
@@ -58,9 +58,9 @@ A yes goes through the normal answer path: spend caps, stored history, and conti
 - `false_positive` when the bot was told to back off;
 - `missed` when the asker @mentioned the bot within 90 s of a skip.
 
-Rows are deleted after 30 days. `docker logs grokbot` shows one `interject ...` line for each candidate (score 5 or more).
+Rows are deleted after 30 days. `docker logs grokbot` shows one `interject ...` line for each message that reached the model or passed the score.
 
-The local model runs in Ollama in grokbot's network namespace (`network_mode: "service:grokbot"` in the homelab stack), so the bot reaches it at `http://127.0.0.1:11434` and no port is published. At startup the bot asks Ollama to pull `INTERJECT_MODEL` in the background and retries with backoff until Ollama is up; until then the strict heuristic decides.
+The local model runs in Ollama in grokbot's network namespace (`network_mode: "service:grokbot"` in the homelab stack), so the bot reaches it at `http://127.0.0.1:11434` and no port is published. At startup the bot asks Ollama to pull `INTERJECT_MODEL` in the background and retries with backoff until Ollama is up, then runs one check to warm the model up (the first inference after a load can take a minute); until then the strict heuristic decides.
 
 ### What the bot sees
 
@@ -168,8 +168,8 @@ These are environment variables. See `.env.example`.
 | `INTERJECT_WINDOW_S` | `120` | How long after an answer the asker can follow up without @. |
 | `INTERJECT_MAX_CHAIN` | `2` | Unprompted answers in a row before an @ is needed again. |
 | `INTERJECT_PER_CHANNEL_HOUR` | `6` | Unprompted answers per channel per hour. `0` means no limit. |
-| `OLLAMA_URL` | (empty) | Local Ollama for the yes/no check, e.g. `http://127.0.0.1:11434`. Empty: heuristics only (score of 8 or more). |
-| `INTERJECT_MODEL` | `qwen2.5:1.5b-instruct-q4_K_M` | Pulled into Ollama at startup. |
+| `OLLAMA_URL` | (empty) | Local Ollama for the follow-up check, e.g. `http://127.0.0.1:11434`. Empty: heuristics only (score of 8 or more). |
+| `INTERJECT_MODEL` | `qwen3:1.7b` | Pulled into Ollama at startup. |
 | `INTERJECT_TIMEOUT_S` | `5` | Longer than this and the strict heuristic decides. |
 | `DEV_GUILD_IDS` | | |
 
